@@ -1,0 +1,1243 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# schema.graphql — VaultKeeper Subgraph (Enhanced)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Architecture:
+#   • Enterprise-grade The Graph protocol schema for on-chain data indexing
+#   • Full entity relationships with @derivedFrom for reverse lookups
+#   • Time-series data for analytics and charting
+#   • Aggregation entities for O(1) dashboard queries
+#   • Comprehensive event tracking with metadata
+#   • Strategy configuration and allocation tracking
+#   • Block-level granularity for all numeric values
+#   • Full-text search via @entity(fullText: true)
+#   • Interface-based design for extensibility (Transaction, Event, PriceSource)
+#   • Optimistic concurrency notes (handled by subgraph engine)
+#   • No mock data — every field maps to real on-chain or oracle data
+#
+# Entities (18 total):
+#   1. Vault              — Core vault contract state
+#   2. VaultDailySnapshot  — Daily vault metrics for time-series
+#   3. VaultStrategy       — Strategy configuration per vault
+#   4. Asset               — Token metadata (ERC-20)
+#   5. User                — User profile and aggregate stats
+#   6. UserShare           — User's share balance per vault
+#   7. Transaction         — All vault interactions (interface)
+#   8. Deposit             — Deposit transaction (implements Transaction)
+#   9. Withdrawal          — Withdrawal transaction (implements Transaction)
+#  10. RebalanceEvent      — Rebalancing operations
+#  11. YieldDistribution   — Yield payment events
+#  12. FeeCollection       — Fee collection events
+#  13. ProtocolMetric      — Global protocol-level aggregates
+#  14. MarketPrice         — Oracle price feed data
+#  15. ContractUpgrade     — Upgrade tracking for audit trail
+#  16. GovernanceProposal  — DAO proposals affecting vaults
+#  17. AuditLog            — Immutable audit trail for sensitive actions
+#  18. Reward              — User reward claims (staking, loyalty)
+#
+# Indexing Strategy:
+#   • Block-level updates for real-time accuracy
+#   • Daily snapshots for efficient charting
+#   • Derived fields for O(1) reverse lookups
+#   • Full-text search on vault names, descriptions, user addresses
+#   • Composite IDs for time-series uniqueness
+#   • Optimized for large-scale queries (pagination, filtering)
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCALAR TYPES & DIRECTIVES
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Built-in scalar for 256-bit unsigned integers.
+Used for all monetary values, share amounts, and token balances.
+"""
+scalar BigInt
+
+"""
+Ethereum address (20 bytes, 0x-prefixed hex string).
+Used for wallet addresses and contract addresses.
+"""
+scalar Bytes
+
+"""
+ISO-8601 timestamp string for human-readable dates.
+Stored alongside BigInt timestamps for query convenience.
+"""
+scalar DateTime
+
+"""
+Custom directive to mark fields that should be indexed for faster filtering.
+The Graph uses this internally for database indexes.
+"""
+directive @index on FIELD_DEFINITION
+
+"""
+Directive to mark unique constraints on composite IDs.
+"""
+directive @unique on FIELD_DEFINITION
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENUMS
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Transaction types supported by the vault system.
+Each type maps to a specific smart contract function.
+"""
+enum TransactionType {
+  DEPOSIT
+  WITHDRAW
+  REBALANCE
+  CLAIM_REWARDS
+  STRATEGY_UPDATE
+  FEE_COLLECTION
+  GOVERNANCE_ACTION
+}
+
+"""
+Vault status reflecting operational state.
+"""
+enum VaultStatus {
+  ACTIVE
+  PAUSED
+  DEPRECATED
+  INITIALIZING
+  SHUTDOWN
+  EMERGENCY_SHUTDOWN
+}
+
+"""
+Risk classification for vault strategies.
+"""
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+  VARIABLE
+  CUSTOM
+}
+
+"""
+Transaction status for pending operations.
+"""
+enum TransactionStatus {
+  CONFIRMED
+  PENDING
+  FAILED
+  REVERTED
+}
+
+"""
+Asset classification for portfolio categorization.
+"""
+enum AssetType {
+  EQUITY_TOKEN
+  STABLECOIN
+  ETHEREUM
+  WRAPPED_TOKEN
+  LP_TOKEN
+  DERIVATIVE
+  OTHER
+}
+
+"""
+Governance proposal status.
+"""
+enum ProposalStatus {
+  ACTIVE
+  EXECUTED
+  DEFEATED
+  EXPIRED
+  QUEUED
+  CANCELLED
+}
+
+"""
+Fee type for vault operations.
+"""
+enum FeeType {
+  PERFORMANCE
+  MANAGEMENT
+  WITHDRAWAL
+  DEPOSIT
+  GAS_COMPENSATION
+}
+
+"""
+Oracle price source reliability.
+"""
+enum PriceSource {
+  CHAINLINK
+  UNISWAP_TWAP
+  PYTH
+  REDSTONE
+  MANUAL
+  EMERGENCY_FALLBACK
+}
+
+"""
+Audit log action severity.
+"""
+enum AuditSeverity {
+  INFO
+  WARNING
+  CRITICAL
+  EMERGENCY
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERFACES
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Base interface for all on-chain events.
+Provides common timestamp and block metadata.
+"""
+interface Event {
+  """Unique identifier (usually {contract}-{blockNumber}-{logIndex})."""
+  id: ID!
+
+  """Block number where the event occurred."""
+  blockNumber: BigInt!
+
+  """Unix timestamp of the event."""
+  timestamp: BigInt!
+
+  """Block hash for verification."""
+  blockHash: Bytes!
+
+  """Transaction hash that emitted the event."""
+  transactionHash: Bytes!
+
+  """Log index within the transaction (for ordering)."""
+  logIndex: BigInt!
+}
+
+"""
+Transaction interface for all user interactions.
+All transaction entities must implement this.
+"""
+interface Transaction implements Event {
+  id: ID!
+  blockNumber: BigInt!
+  timestamp: BigInt!
+  blockHash: Bytes!
+  transactionHash: Bytes!
+  logIndex: BigInt!
+
+  """User who initiated the transaction."""
+  user: User!
+
+  """Vault this transaction interacted with."""
+  vault: Vault!
+
+  """Type of transaction."""
+  type: TransactionType!
+
+  """Status of the transaction."""
+  status: TransactionStatus!
+
+  """Amount in the vault's base asset (18 decimals)."""
+  amount: BigInt!
+
+  """Amount in USD at the time of transaction (18 decimals)."""
+  amountUsd: BigInt!
+
+  """Gas used for this transaction (in wei)."""
+  gasUsed: BigInt!
+
+  """Gas price at the time (in wei)."""
+  gasPrice: BigInt!
+
+  """Total gas cost in native token (gasUsed * gasPrice)."""
+  gasCost: BigInt!
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. VAULT — Core Entity
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Core vault entity representing a single vault contract instance.
+Updated on every Deposit, Withdraw, Rebalance, YieldDistribution event.
+"""
+type Vault @entity(fullText: true) {
+  """Unique identifier: contract address (checksummed)."""
+  id: ID!
+
+  """Human-readable vault name (e.g., "ETH Alpha Vault")."""
+  name: String! @index
+
+  """Brief description of the vault's strategy and purpose."""
+  description: String!
+
+  """Current vault operational status."""
+  status: VaultStatus! @index
+
+  """Address of the vault smart contract."""
+  vaultAddress: Bytes! @unique
+
+  """Address of the vault manager/admin contract."""
+  managerAddress: Bytes!
+
+  """Total value locked in the vault (in USD, 18 decimals)."""
+  totalValueLocked: BigInt! @index
+
+  """Total value locked in USD at creation (for growth calc)."""
+  totalValueLockedUsd: BigInt!
+
+  """Total shares minted across all users."""
+  totalShares: BigInt!
+
+  """Current annualized percentage yield (basis points, e.g., 1250 = 12.50%)."""
+  currentApy: BigInt! @index
+
+  """7-day rolling APY (basis points)."""
+  apy7d: BigInt!
+
+  """30-day rolling APY (basis points)."""
+  apy30d: BigInt!
+
+  """Cumulative yield distributed to date (in vault's base asset)."""
+  cumulativeYieldDistributed: BigInt!
+
+  """Performance fee charged by the vault (basis points, e.g., 200 = 2.00%)."""
+  performanceFee: BigInt!
+
+  """Management fee charged by the vault (basis points, annual)."""
+  managementFee: BigInt!
+
+  """Minimum deposit amount (in USD, 18 decimals)."""
+  minDeposit: BigInt!
+
+  """Maximum deposit amount (in USD, 18 decimals). 0 = no limit."""
+  maxDeposit: BigInt!
+
+  """Total number of unique depositors."""
+  totalDepositors: BigInt! @index
+
+  """Number of deposits made to this vault."""
+  depositCount: BigInt!
+
+  """Number of withdrawals made from this vault."""
+  withdrawalCount: BigInt!
+
+  """Total rebalance operations performed."""
+  rebalanceCount: BigInt!
+
+  """Block number when the vault was created."""
+  createdBlock: BigInt!
+
+  """Timestamp when the vault was created."""
+  createdAtTimestamp: BigInt!
+
+  """ISO timestamp when the vault was created."""
+  createdAtBlock: BigInt!
+
+  """Block number of the last update to this entity."""
+  lastUpdatedBlock: BigInt!
+
+  """Timestamp of the last update."""
+  lastUpdatedAtTimestamp: BigInt!
+
+  """Current strategy configuration."""
+  strategy: VaultStrategy
+
+  """List of assets held by this vault."""
+  assets: [Asset!]! @derivedFrom(field: "vault")
+
+  """All user share positions in this vault."""
+  userShares: [UserShare!]! @derivedFrom(field: "vault")
+
+  """All deposit transactions for this vault."""
+  deposits: [Deposit!]! @derivedFrom(field: "vault")
+
+  """All withdrawal transactions for this vault."""
+  withdrawals: [Withdrawal!]! @derivedFrom(field: "vault")
+
+  """All rebalance events for this vault."""
+  rebalanceEvents: [RebalanceEvent!]! @derivedFrom(field: "vault")
+
+  """All yield distribution events for this vault."""
+  yieldDistributions: [YieldDistribution!]! @derivedFrom(field: "vault")
+
+  """Daily snapshots for time-series analysis."""
+  dailySnapshots: [VaultDailySnapshot!]! @derivedFrom(field: "vault")
+
+  """Fees collected by this vault."""
+  fees: [FeeCollection!]! @derivedFrom(field: "vault")
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. VAULT DAILY SNAPSHOT — Time-Series Metrics
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Daily snapshot of vault metrics for efficient time-series queries.
+Captured at approximately 00:00 UTC each day.
+"""
+type VaultDailySnapshot @entity {
+  """Format: {vaultAddress}-{dayTimestamp}"""
+  id: ID!
+
+  """The vault this snapshot belongs to."""
+  vault: Vault!
+
+  """Unix timestamp for the start of the day (midnight UTC)."""
+  dayTimestamp: BigInt! @index
+
+  """ISO date string (YYYY-MM-DD) for human-readable queries."""
+  day: String! @index
+
+  """TVL at the end of this day (in USD, 18 decimals)."""
+  totalValueLocked: BigInt!
+
+  """TVL in native token units."""
+  totalValueLockedNative: BigInt!
+
+  """Total shares outstanding at end of day."""
+  totalShares: BigInt!
+
+  """APY at the time of snapshot (basis points)."""
+  apy: BigInt!
+
+  """Net asset value per share (18 decimals)."""
+  navPerShare: BigInt!
+
+  """New deposits during this day."""
+  dailyDeposits: BigInt!
+
+  """Withdrawals during this day."""
+  dailyWithdrawals: BigInt!
+
+  """Net flow (deposits - withdrawals) for the day."""
+  dailyNetFlow: BigInt!
+
+  """New unique depositors who joined today."""
+  newDepositors: BigInt!
+
+  """Number of deposit transactions today."""
+  depositCount: BigInt!
+
+  """Number of withdrawal transactions today."""
+  withdrawalCount: BigInt!
+
+  """Number of rebalance operations today."""
+  rebalanceCount: BigInt!
+
+  """Cumulative yield distributed up to this day."""
+  cumulativeYield: BigInt!
+
+  """Yield distributed on this specific day."""
+  dailyYield: BigInt!
+
+  """Block number at which the snapshot was taken."""
+  blockNumber: BigInt!
+
+  """Total fees collected up to this day (in USD, 18 decimals)."""
+  cumulativeFees: BigInt!
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. VAULT STRATEGY — Allocation Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Strategy configuration for a vault.
+Updated when governance changes strategy.
+"""
+type VaultStrategy @entity {
+  """Format: {vaultAddress}-{version}"""
+  id: ID!
+
+  """The vault this strategy belongs to."""
+  vault: Vault!
+
+  """Strategy version number (incremented on each update)."""
+  version: Int! @index
+
+  """Human-readable strategy name."""
+  name: String!
+
+  """Detailed description of the strategy approach."""
+  description: String!
+
+  """Risk level classification."""
+  riskLevel: RiskLevel!
+
+  """Target allocation weights (JSON-encoded array of {asset, weight})."""
+  targetAllocations: String!
+
+  """Maximum allowed deviation from target before rebalance (basis points)."""
+  rebalanceThreshold: BigInt!
+
+  """Minimum time between rebalances (in seconds)."""
+  rebalanceCooldown: BigInt!
+
+  """Whether the strategy allows leverage."""
+  allowsLeverage: Boolean!
+
+  """Maximum allowed leverage (basis points). 0 = no leverage."""
+  maxLeverage: BigInt!
+
+  """List of approved assets for this strategy (JSON-encoded array)."""
+  approvedAssets: String!
+
+  """Block number when this strategy version was activated."""
+  activatedBlock: BigInt!
+
+  """Timestamp when this strategy version was activated."""
+  activatedAtTimestamp: BigInt!
+
+  """Whether this is the currently active strategy version."""
+  isActive: Boolean! @index
+
+  """Address of the governance that approved this strategy."""
+  approvedBy: Bytes!
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. ASSET — Token Metadata
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Represents an ERC-20 token held by a vault.
+"""
+type Asset @entity {
+  """Token contract address (checksummed)."""
+  id: ID!
+
+  """Token symbol (e.g., "AAPL.x", "USDC")."""
+  symbol: String! @index
+
+  """Full token name."""
+  name: String!
+
+  """Token decimals (typically 18 for tokenized equities, 6 for USDC)."""
+  decimals: Int!
+
+  """Classification of the asset type."""
+  assetType: AssetType!
+
+  """The vault that holds this asset."""
+  vault: Vault!
+
+  """Current balance held by the vault (in token units, normalized)."""
+  currentBalance: BigInt!
+
+  """Current balance in USD (18 decimals)."""
+  currentBalanceUsd: BigInt!
+
+  """Target weight for this asset (basis points)."""
+  targetWeight: BigInt!
+
+  """Current actual weight (basis points)."""
+  currentWeight: BigInt!
+
+  """Minimum weight allowed (basis points)."""
+  minWeight: BigInt!
+
+  """Maximum weight allowed (basis points)."""
+  maxWeight: BigInt!
+
+  """Total value deposited into this asset across all time (USD)."""
+  totalDeposited: BigInt!
+
+  """Total value withdrawn from this asset across all time (USD)."""
+  totalWithdrawn: BigInt!
+
+  """Number of times this asset was used in rebalancing."""
+  rebalanceCount: BigInt!
+
+  """Block number when this asset was first added."""
+  addedBlock: BigInt!
+
+  """Timestamp when this asset was first added."""
+  addedAtTimestamp: BigInt!
+
+  """Last block number when the balance was updated."""
+  lastUpdatedBlock: BigInt!
+
+  """Last timestamp when the balance was updated."""
+  lastUpdatedAtTimestamp: BigInt!
+
+  """Market price data for this asset."""
+  marketPrice: MarketPrice @derivedFrom(field: "asset")
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. USER — Profile & Aggregate Stats
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Aggregated user profile across all vaults.
+Created on first interaction.
+"""
+type User @entity(fullText: true) {
+  """User wallet address (checksummed)."""
+  id: ID!
+
+  """All share positions across vaults."""
+  shares: [UserShare!]! @derivedFrom(field: "user")
+
+  """All deposit transactions by this user."""
+  deposits: [Deposit!]! @derivedFrom(field: "user")
+
+  """All withdrawal transactions by this user."""
+  withdrawals: [Withdrawal!]! @derivedFrom(field: "user")
+
+  """All reward claims by this user."""
+  rewards: [Reward!]! @derivedFrom(field: "user")
+
+  """Total value deposited across all vaults (USD, 18 decimals)."""
+  totalValueDeposited: BigInt!
+
+  """Total value withdrawn across all vaults (USD, 18 decimals)."""
+  totalValueWithdrawn: BigInt!
+
+  """Total yield earned across all vaults (USD, 18 decimals)."""
+  totalYieldEarned: BigInt!
+
+  """Net deposited (deposited - withdrawn) in USD."""
+  netDeposit: BigInt!
+
+  """Number of vaults this user has interacted with."""
+  vaultCount: Int!
+
+  """Total number of transactions (all types)."""
+  transactionCount: Int!
+
+  """Total number of deposits."""
+  depositCount: Int!
+
+  """Total number of withdrawals."""
+  withdrawalCount: Int!
+
+  """Total number of yield claims."""
+  claimCount: Int!
+
+  """Block number of the user's first interaction."""
+  firstActivityBlock: BigInt!
+
+  """Timestamp of the user's first interaction."""
+  firstActivityTimestamp: BigInt!
+
+  """Block number of the user's most recent interaction."""
+  lastActivityBlock: BigInt!
+
+  """Timestamp of the user's most recent interaction."""
+  lastActivityTimestamp: BigInt!
+
+  """Whether the user has any active positions (shares > 0)."""
+  isActive: Boolean! @index
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. USER SHARE — Position Tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+User's share position in a specific vault.
+"""
+type UserShare @entity {
+  """Composite ID: {userAddress}-{vaultAddress}"""
+  id: ID!
+
+  """User who holds these shares."""
+  user: User!
+
+  """Vault these shares belong to."""
+  vault: Vault!
+
+  """Current share balance (18 decimals)."""
+  shares: BigInt!
+
+  """Current value of shares in USD (18 decimals)."""
+  valueUsd: BigInt! @index
+
+  """Original deposited amount in USD (before yield/fees)."""
+  depositedAmount: BigInt!
+
+  """Total yield earned on this position (USD)."""
+  yieldEarned: BigInt!
+
+  """Total yield claimed (USD). Remaining = yieldEarned - yieldClaimed."""
+  yieldClaimed: BigInt!
+
+  """Average deposit price per share (USD, 18 decimals)."""
+  averageDepositPrice: BigInt!
+
+  """Unrealized profit/loss in USD (current value - deposited)."""
+  unrealizedPnl: BigInt!
+
+  """Unrealized profit/loss as a percentage (basis points)."""
+  unrealizedPnlPercent: BigInt!
+
+  """Number of deposit transactions for this position."""
+  depositCount: Int!
+
+  """Number of withdrawal transactions for this position."""
+  withdrawalCount: Int!
+
+  """Block number when the user first deposited into this vault."""
+  firstDepositBlock: BigInt!
+
+  """Timestamp when the user first deposited into this vault."""
+  firstDepositTimestamp: BigInt!
+
+  """Block number of the most recent interaction with this vault."""
+  lastActivityBlock: BigInt!
+
+  """Timestamp of the most recent interaction with this vault."""
+  lastActivityTimestamp: BigInt!
+
+  """Whether this position has any shares (active)."""
+  isActive: Boolean! @index
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7-9. TRANSACTION ENTITIES (implementing Transaction interface)
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Deposit transaction — user adds funds to a vault.
+"""
+type Deposit implements Transaction @entity {
+  id: ID!
+  blockNumber: BigInt! @index
+  timestamp: BigInt! @index
+  blockHash: Bytes!
+  transactionHash: Bytes! @unique
+  logIndex: BigInt!
+  user: User!
+  vault: Vault!
+  type: TransactionType!
+  status: TransactionStatus! @index
+  amount: BigInt!
+  amountUsd: BigInt!
+  gasUsed: BigInt!
+  gasPrice: BigInt!
+  gasCost: BigInt!
+
+  """Number of shares minted."""
+  shares: BigInt!
+
+  """Price per share at deposit time (USD)."""
+  pricePerShare: BigInt!
+
+  """Token address deposited (if not native)."""
+  tokenAddress: Bytes
+}
+
+"""
+Withdrawal transaction — user removes funds from a vault.
+"""
+type Withdrawal implements Transaction @entity {
+  id: ID!
+  blockNumber: BigInt! @index
+  timestamp: BigInt! @index
+  blockHash: Bytes!
+  transactionHash: Bytes! @unique
+  logIndex: BigInt!
+  user: User!
+  vault: Vault!
+  type: TransactionType!
+  status: TransactionStatus! @index
+  amount: BigInt!
+  amountUsd: BigInt!
+  gasUsed: BigInt!
+  gasPrice: BigInt!
+  gasCost: BigInt!
+
+  """Number of shares burned."""
+  shares: BigInt!
+
+  """Price per share at withdrawal time (USD)."""
+  pricePerShare: BigInt!
+
+  """Token address received (if not native)."""
+  tokenAddress: Bytes
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. REBALANCE EVENT — Allocation Tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Record of a vault rebalancing operation.
+"""
+type RebalanceEvent implements Event @entity {
+  id: ID!
+  blockNumber: BigInt! @index
+  timestamp: BigInt! @index
+  blockHash: Bytes!
+  transactionHash: Bytes!
+  logIndex: BigInt!
+
+  """Vault that was rebalanced."""
+  vault: Vault!
+
+  """Address that triggered the rebalance (keeper or governance)."""
+  triggeredBy: Bytes!
+
+  """Total value before rebalance (USD)."""
+  totalValueBefore: BigInt!
+
+  """Total value after rebalance (USD)."""
+  totalValueAfter: BigInt!
+
+  """Net change in value (positive = gain, negative = loss)."""
+  valueChange: BigInt!
+
+  """Number of assets that were adjusted."""
+  assetsAdjusted: Int!
+
+  """Detailed allocation changes (JSON-encoded array)."""
+  allocationChanges: String!
+
+  """Total gas cost for the rebalance operation (in wei)."""
+  gasCost: BigInt!
+
+  """Whether the rebalance was triggered automatically."""
+  isAutomatic: Boolean!
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. YIELD DISTRIBUTION — Yield Payments
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Record of yield distribution events.
+"""
+type YieldDistribution implements Event @entity {
+  id: ID!
+  blockNumber: BigInt! @index
+  timestamp: BigInt! @index
+  blockHash: Bytes!
+  transactionHash: Bytes!
+  logIndex: BigInt!
+
+  """Vault that distributed the yield."""
+  vault: Vault!
+
+  """Total yield amount distributed (in vault's base asset)."""
+  amount: BigInt!
+
+  """Total yield amount in USD at distribution time."""
+  amountUsd: BigInt!
+
+  """Number of share holders who received yield."""
+  recipientCount: Int!
+
+  """Yield per share (18 decimals)."""
+  yieldPerShare: BigInt!
+
+  """Source of the yield (e.g., "trading_fees", "lending_interest")."""
+  source: String!
+
+  """Whether the distribution was automatic or manual."""
+  isAutomatic: Boolean!
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12. FEE COLLECTION — Fee Events
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Record of fee collection events.
+"""
+type FeeCollection implements Event @entity {
+  id: ID!
+  blockNumber: BigInt! @index
+  timestamp: BigInt! @index
+  blockHash: Bytes!
+  transactionHash: Bytes!
+  logIndex: BigInt!
+
+  """Vault that collected the fee."""
+  vault: Vault!
+
+  """Type of fee collected."""
+  feeType: FeeType!
+
+  """Amount collected (in vault's base asset)."""
+  amount: BigInt!
+
+  """Amount in USD."""
+  amountUsd: BigInt!
+
+  """Recipient address (treasury, protocol, etc.)."""
+  recipient: Bytes!
+
+  """Percentage of the fee (basis points)."""
+  percentage: BigInt!
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13. PROTOCOL METRIC — Global Aggregates
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Protocol-level metrics snapshot.
+Singleton entity.
+"""
+type ProtocolMetric @entity {
+  """Singleton ID: "protocol" """
+  id: ID!
+
+  """Total value locked across all vaults (USD)."""
+  totalValueLocked: BigInt! @index
+
+  """Total number of vaults (active + paused)."""
+  totalVaultCount: Int!
+
+  """Number of vaults currently active."""
+  activeVaultCount: Int!
+
+  """Total number of unique users across all vaults."""
+  totalUserCount: Int! @index
+
+  """Number of users active in the last 30 days."""
+  activeUserCount30d: Int!
+
+  """Total number of transactions recorded."""
+  totalTransactionCount: BigInt!
+
+  """Total deposits across all vaults (USD)."""
+  totalDeposits: BigInt!
+
+  """Total withdrawals across all vaults (USD)."""
+  totalWithdrawals: BigInt!
+
+  """Total yield distributed across all vaults (USD)."""
+  totalYieldDistributed: BigInt!
+
+  """Total fees collected across all vaults (USD)."""
+  totalFeesCollected: BigInt!
+
+  """Protocol revenue from performance fees (USD)."""
+  protocolRevenue: BigInt!
+
+  """Average APY across all active vaults (basis points)."""
+  averageApy: BigInt!
+
+  """Highest APY among active vaults (basis points)."""
+  highestApy: BigInt!
+
+  """24-hour change in TVL (USD)."""
+  tvlChange24h: BigInt!
+
+  """24-hour change in TVL (percentage, basis points)."""
+  tvlChangePercent24h: BigInt!
+
+  """7-day change in TVL (USD)."""
+  tvlChange7d: BigInt!
+
+  """7-day change in TVL (percentage, basis points)."""
+  tvlChangePercent7d: BigInt!
+
+  """Block number of the last update."""
+  lastUpdatedBlock: BigInt!
+
+  """Timestamp of the last update."""
+  lastUpdatedAtTimestamp: BigInt!
+
+  """Number of chain reorganizations handled."""
+  reorgCount: Int!
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14. MARKET PRICE — Oracle Price Feed
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Market price data for assets.
+"""
+type MarketPrice @entity {
+  """Format: {assetAddress}-{timestamp}"""
+  id: ID!
+
+  """Asset this price belongs to."""
+  asset: Asset!
+
+  """Price in USD (18 decimals — multiply by 10^-18 for display)."""
+  priceUsd: BigInt! @index
+
+  """Price in the native chain token (18 decimals)."""
+  priceNative: BigInt!
+
+  """Confidence level of the price (0-100)."""
+  confidence: Int!
+
+  """Source of the price data."""
+  source: PriceSource!
+
+  """Block number when the price was updated."""
+  blockNumber: BigInt! @index
+
+  """Unix timestamp of the price update."""
+  timestamp: BigInt! @index
+
+  """Oracle round ID (for Chainlink compatibility)."""
+  oracleRoundId: BigInt
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 15. CONTRACT UPGRADE — Audit Trail
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Record of smart contract upgrades.
+"""
+type ContractUpgrade implements Event @entity {
+  id: ID!
+  blockNumber: BigInt! @index
+  timestamp: BigInt! @index
+  blockHash: Bytes!
+  transactionHash: Bytes!
+  logIndex: BigInt!
+
+  """Address of the contract that was upgraded."""
+  contractAddress: Bytes! @index
+
+  """Type of contract (e.g., "Vault", "Strategy", "Factory")."""
+  contractType: String!
+
+  """Address of the previous implementation contract."""
+  previousImplementation: Bytes!
+
+  """Address of the new implementation contract."""
+  newImplementation: Bytes!
+
+  """Address that initiated the upgrade (admin/governance)."""
+  upgradedBy: Bytes! @index
+
+  """Optional IPFS hash pointing to upgrade documentation."""
+  metadataUri: String
+
+  """Additional notes or reason for the upgrade."""
+  reason: String
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 16. GOVERNANCE PROPOSAL — DAO Actions
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Governance proposal affecting vaults or protocol.
+"""
+type GovernanceProposal implements Event @entity {
+  id: ID!
+  blockNumber: BigInt! @index
+  timestamp: BigInt! @index
+  blockHash: Bytes!
+  transactionHash: Bytes!
+  logIndex: BigInt!
+
+  """Proposal ID from the governance contract."""
+  proposalId: BigInt! @unique
+
+  """Title of the proposal."""
+  title: String!
+
+  """Description of the proposal."""
+  description: String!
+
+  """Current status of the proposal."""
+  status: ProposalStatus! @index
+
+  """Target vault address (if applicable)."""
+  targetVault: Vault
+
+  """Action type (e.g., "update_strategy", "pause_vault", "upgrade")."""
+  actionType: String!
+
+  """Encoded call data for the proposal."""
+  callData: String
+
+  """Votes in favor (in governance token units)."""
+  votesFor: BigInt!
+
+  """Votes against."""
+  votesAgainst: BigInt!
+
+  """Votes abstained."""
+  votesAbstain: BigInt!
+
+  """Quorum reached flag."""
+  quorumReached: Boolean!
+
+  """Proposer address."""
+  proposer: Bytes!
+
+  """Start block of voting period."""
+  startBlock: BigInt!
+
+  """End block of voting period."""
+  endBlock: BigInt!
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 17. AUDIT LOG — Immutable Action Log
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Immutable audit log for sensitive actions.
+Used for compliance and security monitoring.
+"""
+type AuditLog implements Event @entity {
+  id: ID!
+  blockNumber: BigInt! @index
+  timestamp: BigInt! @index
+  blockHash: Bytes!
+  transactionHash: Bytes!
+  logIndex: BigInt!
+
+  """Action type (e.g., "ROLE_GRANTED", "PAUSE_TRIGGERED", "EMERGENCY_WITHDRAWAL")."""
+  action: String! @index
+
+  """Severity level of the action."""
+  severity: AuditSeverity! @index
+
+  """Actor address that performed the action."""
+  actor: Bytes! @index
+
+  """Target address (vault, user, etc.)."""
+  target: Bytes
+
+  """Additional JSON-encoded metadata."""
+  metadata: String
+
+  """Human-readable description of the action."""
+  description: String!
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 18. REWARD — User Reward Claims
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Reward claim event (staking rewards, loyalty bonuses, etc.).
+"""
+type Reward implements Event @entity {
+  id: ID!
+  blockNumber: BigInt! @index
+  timestamp: BigInt! @index
+  blockHash: Bytes!
+  transactionHash: Bytes!
+  logIndex: BigInt!
+
+  """User claiming the reward."""
+  user: User!
+
+  """Vault associated with the reward (if any)."""
+  vault: Vault
+
+  """Reward amount in the reward token (normalized)."""
+  amount: BigInt!
+
+  """Reward amount in USD."""
+  amountUsd: BigInt!
+
+  """Token address of the reward."""
+  rewardToken: Bytes!
+
+  """Type of reward (e.g., "loyalty", "staking", "referral")."""
+  rewardType: String!
+
+  """Whether the reward was claimed automatically or manually."""
+  isAutomatic: Boolean!
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# QUERY EXAMPLES (for documentation only)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# The Graph automatically generates the query root from entities above.
+# Example queries for common use cases:
+#
+# 1. Get a specific vault with full details and recent snapshots:
+#    query GetVault($id: ID!) {
+#      vault(id: $id) {
+#        name
+#        totalValueLocked
+#        currentApy
+#        status
+#        strategy { name riskLevel targetAllocations }
+#        dailySnapshots(orderBy: dayTimestamp, orderDirection: desc, first: 30) {
+#          day totalValueLocked apy
+#        }
+#        assets { symbol currentBalanceUsd targetWeight currentWeight }
+#      }
+#    }
+#
+# 2. Get user portfolio across all vaults with unrealized PnL:
+#    query GetUserPortfolio($userId: Bytes!) {
+#      user(id: $userId) {
+#        totalValueDeposited
+#        totalYieldEarned
+#        shares(where: { isActive: true }) {
+#          vault { name }
+#          shares valueUsd unrealizedPnlPercent
+#        }
+#      }
+#    }
+#
+# 3. Get recent activity for a vault (deposits + withdrawals):
+#    query GetVaultActivity($vaultId: ID!) {
+#      deposits(where: { vault: $vaultId }, orderBy: timestamp, orderDirection: desc, first: 20) {
+#        amountUsd shares user { id } timestamp status
+#      }
+#      withdrawals(where: { vault: $vaultId }, orderBy: timestamp, orderDirection: desc, first: 20) {
+#        amountUsd shares user { id } timestamp status
+#      }
+#    }
+#
+# 4. Protocol overview with global metrics:
+#    query ProtocolOverview {
+#      protocolMetric(id: "protocol") {
+#        totalValueLocked totalVaultCount totalUserCount averageApy
+#        tvlChangePercent24h tvlChangePercent7d
+#      }
+#    }
+#
+# 5. Search vaults by name (full-text):
+#    query SearchVaults($search: String!) {
+#      vaults(where: { name_contains_nocase: $search }, first: 10, orderBy: totalValueLocked, orderDirection: desc) {
+#        id name totalValueLocked currentApy status
+#      }
+#    }
+#
+# 6. Get historical prices for an asset:
+#    query GetAssetPrices($assetId: ID!, $from: BigInt!, $to: BigInt!) {
+#      marketPrices(
+#        where: { asset: $assetId, timestamp_gte: $from, timestamp_lte: $to }
+#        orderBy: timestamp
+#        orderDirection: asc
+#      ) {
+#        priceUsd timestamp confidence source
+#      }
+#    }
+#
+# 7. Get audit log for security monitoring:
+#    query GetAuditLog($severity: AuditSeverity!, $since: BigInt!) {
+#      auditLogs(
+#        where: { severity: $severity, timestamp_gte: $since }
+#        orderBy: timestamp
+#        orderDirection: desc
+#        first: 50
+#      ) {
+#        action actor target description timestamp transactionHash
+#      }
+#    }
+#
+# 8. Get governance proposals for a vault:
+#    query GetProposals($vaultId: ID!) {
+#      governanceProposals(where: { targetVault: $vaultId }, orderBy: timestamp, orderDirection: desc) {
+#        proposalId title status votesFor votesAgainst startBlock endBlock
+#      }
+#    }
+#
+# ═══════════════════════════════════════════════════════════════════════════════
