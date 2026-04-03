@@ -3,7 +3,7 @@
 **Automated Multi-Strategy Vault for Tokenized Equities**
 
 [![Solidity](https://img.shields.io/badge/Solidity-0.8.28-blue.svg)](https://soliditylang.org/)
-[![Next.js](https://img.shields.io/badge/Next.js-14-black.svg)](https://nextjs.org/)
+[![Next.js](https://img.shields.io/badge/Next.js-14.2.22-black.svg)](https://nextjs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0-blue.svg)](https://www.typescriptlang.org/)
 [![Foundry](https://img.shields.io/badge/Foundry-Forge-red.svg)](https://book.getfoundry.sh/)
 [![wagmi](https://img.shields.io/badge/wagmi-3.x-green.svg)](https://wagmi.sh/)
@@ -74,22 +74,28 @@ VaultKeeper is a production-grade DeFi vault that automates portfolio management
 |---------|-------------|
 | **Live Dashboard** | Real-time TVL, APY, user count from analytics endpoints |
 | **Strategy Selector** | Risk-based allocation (Conservative/Balanced/Aggressive) with sliders |
-| **Wallet Integration** | wagmi v2 + RainbowKit support for multiple wallets |
+| **Wallet Integration** | wagmi 3.6.0 + viem for multiple wallet connections |
 | **Portfolio Analytics** | Deposit/withdraw history, yield tracking, rebalancing logs |
 | **Health Monitoring** | System health status, network status, performance metrics |
 | **Backtesting API** | Historical strategy performance simulation |
 | **Responsive Design** | Mobile-first with fluid typography and animations |
+| **Theme Toggle** | Dark/Light mode switching with system preference detection |
+| **Error Boundaries** | Graceful error handling with retry mechanisms |
+| **Offline Detection** | Network status monitoring with user notifications |
 
 ### API Endpoints
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /api/portfolio/stats` | Portfolio statistics and vault positions |
 | `GET /api/activity` | On-chain activity feed (deposits, withdrawals, rebalances) |
 | `POST /api/backtest` | Strategy backtesting simulation |
-| `GET /api/vaults/positions` | Current vault allocations and token balances |
-| `GET /api/rebalance-proof` | Rebalancing proof verification |
 | `GET /api/health` | System health check |
+| `GET /api/market/volatility` | Market volatility metrics |
+| `GET /api/portfolio/history` | User's portfolio transaction history |
+| `GET /api/portfolio/stats` | Portfolio statistics and vault positions |
+| `GET /api/rebalance-proof` | Rebalancing proof verification |
+| `GET /api/strategies` | Available vault strategies |
+| `GET /api/vaults/positions` | Current vault allocations and token balances |
 
 ---
 
@@ -103,13 +109,15 @@ VaultKeeper is a production-grade DeFi vault that automates portfolio management
 - **Uniswap V3** for real token swaps
 
 ### Frontend
-- **Next.js 14** with App Router and Server Components
+- **Next.js 14.2.22** with App Router and Server Components
 - **TypeScript 5** with strict type checking
-- **wagmi 3.x + viem** for Ethereum interactions
-- **Tailwind CSS** with custom CSS variables for theming
-- **Framer Motion** for animations
-- **Recharts** for data visualization
+- **wagmi 3.6.0 + viem 2.47.6** for Ethereum interactions
+- **@tanstack/react-query 5.96.0** for data fetching
+- **Tailwind CSS 3.4.1** with custom CSS variables for theming
+- **Framer Motion 12.38.0** for animations
+- **Recharts 3.8.1** for data visualization
 - **Lucide React** for icons
+- **sonner** for toast notifications
 
 ### DevOps
 - **ESLint** with Next.js config (clean lint, zero errors)
@@ -234,31 +242,63 @@ npm run lint  # Zero errors, 5 warnings (non-blocking)
 VaultKeeper/
 ├── contracts/           # Foundry-based smart contracts
 │   ├── src/
-│   │   ├── VaultKeeper.sol      # Main vault contract
+│   │   ├── VaultKeeper.sol      # Main ERC-4626 vault contract
 │   │   ├── Automation.sol       # Chainlink Automation keeper
-│   │   ├── RebalanceProof.sol   # Proof verification
-│   │   ├── XStockIntegration.sol # xStocks adapter
-│   │   ├── PriceFeed.sol        # Oracle aggregation
+│   │   ├── RebalanceProof.sol   # Cryptographic proof verification
+│   │   ├── XStockIntegration.sol # xStocks protocol adapter
+│   │   ├── PriceFeed.sol        # Multi-oracle price aggregation
+│   │   ├── Counter.sol          # Additional vault utilities
+│   │   ├── MockERC20.sol        # Test token mock
+│   │   ├── MockPriceFeed.sol    # Test price oracle mock
 │   │   └── interfaces/          # Contract interfaces
+│   │       ├── IVaultKeeper.sol
+│   │       ├── IRebalanceProof.sol
+│   │       ├── IXStocks.sol
+│   │       └── IXStockVault.sol
 │   ├── test/            # Foundry tests
 │   ├── script/          # Deployment scripts
-│   └── lib/             # Dependencies (OpenZeppelin, etc.)
+│   ├── lib/             # Dependencies (OpenZeppelin, Chainlink)
+│   └── foundry.toml     # Foundry configuration
 │
-├── web/                 # Next.js frontend
-│   ├── app/             # App Router pages
+├── web/                 # Next.js 14 frontend
+│   ├── app/
 │   │   ├── page.tsx     # Landing page
-│   │   ├── dashboard/   # Dashboard layout & pages
+│   │   ├── layout.tsx   # Root layout with providers
+│   │   ├── providers.tsx # wagmi and query providers
+│   │   ├── globals.css  # Tailwind + custom CSS variables
+│   │   ├── dashboard/   # Dashboard pages
+│   │   │   ├── page.tsx
+│   │   │   ├── layout.tsx
+│   │   │   ├── strategy/
+│   │   │   └── vaults/
 │   │   └── api/         # API routes
-│   ├── components/      # React components
+│   │       ├── activity/
+│   │       ├── backtest/
+│   │       ├── health/
+│   │       ├── market/volatility/
+│   │       ├── portfolio/history/
+│   │       ├── portfolio/stats/
+│   │       ├── rebalance-proof/
+│   │       ├── strategies/
+│   │       └── vaults/
+│   ├── components/    # React components
 │   │   ├── StrategySelector.tsx
 │   │   ├── VaultCard.tsx
 │   │   ├── ErrorBoundary.tsx
-│   │   └── ...
+│   │   ├── HealthIndicator.tsx
+│   │   ├── HealthStatusProvider.tsx
+│   │   ├── OfflineBanner.tsx
+│   │   ├── PerformanceMonitor.tsx
+│   │   └── ThemeToggle.tsx
 │   ├── lib/             # Utilities & constants
-│   └── public/          # Static assets
+│   ├── public/          # Static assets
+│   └── package.json     # Dependencies
 │
-├── subgraph/            # The Graph subgraph (optional)
+├── subgraph/            # The Graph subgraph schema
+│   └── schema.graphql   # Comprehensive entity definitions
+│
 └── docs/                # Additional documentation
+    └── XSTOCKS_INTEGRATION.md  # xStocks protocol integration guide
 ```
 
 ---
