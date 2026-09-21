@@ -1,0 +1,79 @@
+name: contracts
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FOUNDRY_PROFILE: ci
+
+defaults:
+  run:
+    working-directory: contracts
+
+jobs:
+  test:
+    name: forge fmt / build / test / script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # Dependencies (forge-std, OpenZeppelin, Chainlink, Pyth) are vendored under
+      # contracts/lib, so no `forge install` and no network fetch is required.
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Show Forge version
+        run: forge --version
+
+      - name: Formatting
+        run: forge fmt --check src test script
+
+      - name: Build (with contract sizes)
+        run: forge build --sizes
+
+      - name: Test
+        run: forge test -vvv
+
+      - name: Lint
+        run: forge lint src test
+
+      # Smoke-tests the deployment script against an in-memory EVM. The key below is
+      # Anvil's well-known first account; nothing is broadcast and no RPC is contacted.
+      - name: Deployment script (dry run)
+        run: |
+          PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+            forge script script/Deploy.s.sol:Deploy
+
+  # Opt-in live integration suite. Runs only when the repository has a MAINNET_RPC_URL
+  # secret, so CI stays green and hermetic without one. The suite forks mainnet and
+  # asserts real chain state (see README section 11); without the secret it is skipped.
+  fork-test:
+    name: live mainnet integration (optional)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Fork test
+        env:
+          MAINNET_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
+        run: |
+          if [ -z "$MAINNET_RPC_URL" ]; then
+            echo "MAINNET_RPC_URL secret not set - skipping live mainnet suites"
+            exit 0
+          fi
+          # Runs everything; the two fork suites execute for real because an RPC is present,
+          # including the one that makes the vault trade tokenised equities on live pools.
+          forge test -vv

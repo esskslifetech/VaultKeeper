@@ -2,10 +2,15 @@
 cache/
 out/
 
-# Ignores development broadcast logs
+# ── Deployment records ──────────────────────────────────────────────────────
+# Real deployments are tracked: the broadcast record and the deployment manifest are
+# the audit trail for what went on chain, and are far cheaper to keep than to lose.
+# Only local-development noise is ignored here: anvil's chain id 31337, and dry runs
+# (which never touch a chain at all). Manifests for other chain ids are tracked too.
 !/broadcast
 /broadcast/*/31337/
 /broadcast/**/dry-run/
+/deployments/31337.json
 
 # Docs
 docs/

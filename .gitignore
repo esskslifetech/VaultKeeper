@@ -1,0 +1,39 @@
+# ── Local runtime artefacts (created by ./vaultkeeper) ──────────────────────
+.pids/
+.logs/
+
+# ── Foundry build artefacts ─────────────────────────────────────────────────
+out/
+cache/
+contracts/out/
+contracts/cache/
+.gas-snapshot
+
+# ── Deployment records are deliberately NOT ignored here ────────────────────
+# `contracts/broadcast/` (the full transaction record) and `contracts/deployments/`
+# (the address manifest) are kept in version control: a deployment is a record worth
+# auditing later, and losing it is worse than carrying a few KB.
+# Only local-development noise is ignored — anvil's chain id 31337 and dry runs —
+# by the rules in contracts/.gitignore. See README section 4.
+
+# ── Secrets: never commit a real key ────────────────────────────────────────
+.env
+.env.*
+!.env.example
+contracts/.env
+*.pem
+*.key
+
+# ── Editors / OS ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Node, if a frontend is ever added ───────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.next/

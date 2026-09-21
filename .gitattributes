@@ -1,0 +1,7 @@
+# Keep vendored dependencies out of GitHub's language statistics: they are checked in so the
+# project builds without `forge install` or network access, not because they are ours.
+contracts/lib/** linguist-vendored
+
+# Reference material, not source.
+docs/** linguist-documentation
+LICENSE linguist-documentation

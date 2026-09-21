@@ -24,6 +24,8 @@ pragma solidity ^0.8.28;
 //  No mock data — all price feeds must return real on-chain prices.
 // ============================================================================
 
+import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
+
 // ----------------------------------------------------------------------------
 //  Constants & Library (Pure Helpers)
 // ----------------------------------------------------------------------------
@@ -70,22 +72,23 @@ library XStocksLib {
         uint256 priceCollateral,
         uint8 collateralDecimals
     ) internal pure returns (uint256 collateralNeeded) {
-        // Convert xStock amount to USD value (8 decimals)
-        uint256 valueUsd = (amountXStock * priceXStock) / 10**18;
-        // Apply collateral ratio
-        uint256 requiredUsd = (valueUsd * collateralRatio) / BPS;
-        // Convert USD to collateral amount
-        collateralNeeded = (requiredUsd * 10**collateralDecimals) / priceCollateral;
+        // value = amount * price / 1e18, then * ratio / BPS, then / priceCollateral * 10^decimals.
+        // Folding the two divisions into a single mulDiv keeps full precision: the
+        // previous form truncated at every step (the collateral ratio alone lost up to
+        // 0.999 * 10^8 USD-wei on a 1e8-scaled price).
+        uint256 valueUsd = Math.mulDiv(amountXStock, priceXStock, 10 ** 18);
+        collateralNeeded = Math.mulDiv(valueUsd, collateralRatio * 10 ** collateralDecimals, BPS * priceCollateral);
     }
 
     /// @notice Computes the health factor of a position.
     /// @param collateralValue  USD value of collateral (8 decimals).
     /// @param mintedValue      USD value of minted xStock (8 decimals).
     /// @return healthFactor    Health factor in bps (BPS = 100%).
-    function computeHealthFactor(
-        uint256 collateralValue,
-        uint256 mintedValue
-    ) internal pure returns (uint256 healthFactor) {
+    function computeHealthFactor(uint256 collateralValue, uint256 mintedValue)
+        internal
+        pure
+        returns (uint256 healthFactor)
+    {
         if (mintedValue == 0) return type(uint256).max;
         healthFactor = (collateralValue * BPS) / mintedValue;
     }
@@ -102,10 +105,11 @@ library XStocksLib {
     /// @param liquidationFeeBps Fee in bps (e.g., 500 = 5%).
     /// @return liquidatorShare Collateral that goes to the liquidator.
     /// @return protocolShare Collateral that goes to the protocol.
-    function computeLiquidationSplit(
-        uint256 collateralSeized,
-        uint256 liquidationFeeBps
-    ) internal pure returns (uint256 liquidatorShare, uint256 protocolShare) {
+    function computeLiquidationSplit(uint256 collateralSeized, uint256 liquidationFeeBps)
+        internal
+        pure
+        returns (uint256 liquidatorShare, uint256 protocolShare)
+    {
         liquidatorShare = (collateralSeized * liquidationFeeBps) / BPS;
         protocolShare = collateralSeized - liquidatorShare;
     }
@@ -138,14 +142,14 @@ library XStocksLib {
 /// @param lastPriceUpdate  Timestamp of the last price update.
 /// @param totalSupply      Current total supply of this xStock.
 struct StockInfo {
-    string  symbol;
+    string symbol;
     uint256 underlyingPrice;
     uint256 collateralRatio;
     uint256 mintFeeBps;
     uint256 redeemFeeBps;
     address priceFeed;
     uint256 maxPositionSize;
-    bool    isActive;
+    bool isActive;
     uint256 lastPriceUpdate;
     uint256 totalSupply;
 }
@@ -158,12 +162,12 @@ struct StockInfo {
 /// @param healthFactor      Position health in bps (BPS = 100%).
 /// @param isLiquidatable    Whether the position may be liquidated now.
 struct PositionSnapshot {
-    string  stockSymbol;
+    string stockSymbol;
     uint256 xStockBalance;
     uint256 collateralValue;
     uint256 mintedValue;
     uint256 healthFactor;
-    bool    isLiquidatable;
+    bool isLiquidatable;
 }
 
 /// @notice Summary of a single collateral asset held by the protocol.
@@ -179,7 +183,7 @@ struct CollateralSummary {
     uint256 valueUsd;
     address priceFeed;
     uint256 lastPriceUpdate;
-    uint8   decimals;
+    uint8 decimals;
 }
 
 /// @notice Global protocol health metrics.
@@ -195,7 +199,7 @@ struct ProtocolHealth {
     uint256 overallHealthFactor;
     uint256 uniqueCollateralAssets;
     uint256 uniqueStocks;
-    bool    isPaused;
+    bool isPaused;
 }
 
 /// @notice Mint request parameters with slippage protection.
@@ -206,7 +210,7 @@ struct ProtocolHealth {
 /// @param receiver         Address that receives the minted xStock.
 /// @param deadline         Expiration timestamp (0 = no deadline).
 struct MintRequest {
-    string  stockSymbol;
+    string stockSymbol;
     uint256 amount;
     address collateralAsset;
     uint256 maxCollateral;
@@ -221,7 +225,7 @@ struct MintRequest {
 /// @param receiver          Address that receives the collateral.
 /// @param deadline          Expiration timestamp (0 = no deadline).
 struct RedeemRequest {
-    string  stockSymbol;
+    string stockSymbol;
     uint256 amount;
     uint256 minCollateralOut;
     address receiver;
@@ -296,7 +300,7 @@ error BatchOperationFailed(uint256 index, string reason);
 
 event XStockMinted(
     address indexed user,
-    string  indexed stockSymbol,
+    string indexed stockSymbol,
     uint256 amount,
     address indexed collateralAsset,
     uint256 collateralUsed,
@@ -306,7 +310,7 @@ event XStockMinted(
 
 event XStockRedeemed(
     address indexed user,
-    string  indexed stockSymbol,
+    string indexed stockSymbol,
     uint256 amount,
     uint256 collateralOut,
     uint256 fee,
@@ -314,80 +318,41 @@ event XStockRedeemed(
 );
 
 event StockRegistered(
-    string  indexed stockSymbol,
-    address priceFeed,
-    uint256 collateralRatio,
-    uint256 mintFeeBps,
-    uint256 redeemFeeBps
+    string indexed stockSymbol, address priceFeed, uint256 collateralRatio, uint256 mintFeeBps, uint256 redeemFeeBps
 );
 
 event StockDeregistered(string indexed stockSymbol);
 
-event CollateralRatioUpdated(
-    string indexed stockSymbol,
-    uint256 oldRatio,
-    uint256 newRatio
-);
+event CollateralRatioUpdated(string indexed stockSymbol, uint256 oldRatio, uint256 newRatio);
 
-event FeeUpdated(
-    string indexed stockSymbol,
-    string feeType,
-    uint256 oldValue,
-    uint256 newValue
-);
+event FeeUpdated(string indexed stockSymbol, string feeType, uint256 oldValue, uint256 newValue);
 
-event PriceFeedUpdated(
-    string indexed stockSymbol,
-    address oldFeed,
-    address newFeed
-);
+event PriceFeedUpdated(string indexed stockSymbol, address oldFeed, address newFeed);
 
-event CollateralDeposited(
-    address indexed user,
-    address indexed asset,
-    uint256 amount
-);
+event CollateralDeposited(address indexed user, address indexed asset, uint256 amount);
 
-event CollateralWithdrawn(
-    address indexed user,
-    address indexed asset,
-    uint256 amount
-);
+event CollateralWithdrawn(address indexed user, address indexed asset, uint256 amount);
 
 event PositionLiquidated(
     address indexed liquidator,
     address indexed owner,
-    string  indexed stockSymbol,
+    string indexed stockSymbol,
     uint256 xStockAmount,
     uint256 collateralSeized,
     uint256 liquidationFee
 );
 
-event MaxPositionSizeUpdated(
-    string indexed stockSymbol,
-    uint256 oldMax,
-    uint256 newMax
-);
+event MaxPositionSizeUpdated(string indexed stockSymbol, uint256 oldMax, uint256 newMax);
 
 event PauseStateChanged(bool paused, string reason);
 
-event GovernorTransferred(
-    address indexed oldGovernor,
-    address indexed newGovernor
-);
+event GovernorTransferred(address indexed oldGovernor, address indexed newGovernor);
 
-event CollateralAssetRegistered(
-    address indexed asset,
-    address priceFeed
-);
+event CollateralAssetRegistered(address indexed asset, address priceFeed);
 
 event CollateralAssetDeregistered(address indexed asset);
 
-event FeesCollected(
-    address indexed asset,
-    uint256 amount,
-    address recipient
-);
+event FeesCollected(address indexed asset, uint256 amount, address recipient);
 
 event GovernanceAccepted(address indexed newGovernor);
 event OracleManagerUpdated(address indexed oldManager, address indexed newManager);
@@ -456,36 +421,25 @@ interface IXStocksProtocol {
     // ------------------------------------------------------------------------
 
     /// @notice Mint xStock tokens by depositing collateral.
-    function mintXStock(
-        string calldata stockSymbol,
-        uint256 amount,
-        address collateralAsset,
-        uint256 maxCollateral
-    ) external returns (uint256 collateralUsed, uint256 fee);
-
-    /// @notice Mint xStock using a request struct (includes deadline).
-    function mintXStock(MintRequest calldata request)
+    function mintXStock(string calldata stockSymbol, uint256 amount, address collateralAsset, uint256 maxCollateral)
         external
         returns (uint256 collateralUsed, uint256 fee);
+
+    /// @notice Mint xStock using a request struct (includes deadline).
+    function mintXStock(MintRequest calldata request) external returns (uint256 collateralUsed, uint256 fee);
 
     /// @notice Batch mint multiple xStocks in one transaction.
     /// @param batch BatchMintRequest containing multiple mint requests.
     /// @return result Summary of the batch operation.
-    function batchMintXStock(BatchMintRequest calldata batch)
-        external
-        returns (BatchMintResult memory result);
+    function batchMintXStock(BatchMintRequest calldata batch) external returns (BatchMintResult memory result);
 
     /// @notice Redeem xStock tokens for collateral.
-    function redeemXStock(
-        string calldata stockSymbol,
-        uint256 amount,
-        uint256 minCollateralOut
-    ) external returns (uint256 collateralOut, uint256 fee);
-
-    /// @notice Redeem using a request struct (includes deadline).
-    function redeemXStock(RedeemRequest calldata request)
+    function redeemXStock(string calldata stockSymbol, uint256 amount, uint256 minCollateralOut)
         external
         returns (uint256 collateralOut, uint256 fee);
+
+    /// @notice Redeem using a request struct (includes deadline).
+    function redeemXStock(RedeemRequest calldata request) external returns (uint256 collateralOut, uint256 fee);
 
     /// @notice Batch redeem multiple xStocks.
     function batchRedeemXStock(RedeemRequest[] calldata requests)
@@ -497,56 +451,35 @@ interface IXStocksProtocol {
     // ------------------------------------------------------------------------
 
     /// @notice Simulates a mint operation without modifying state.
-    function quoteMintXStock(MintRequest calldata request)
-        external
-        view
-        returns (MintQuote memory quote);
+    function quoteMintXStock(MintRequest calldata request) external view returns (MintQuote memory quote);
 
     /// @notice Simulates a redeem operation without modifying state.
-    function quoteRedeemXStock(RedeemRequest calldata request)
-        external
-        view
-        returns (RedeemQuote memory quote);
+    function quoteRedeemXStock(RedeemRequest calldata request) external view returns (RedeemQuote memory quote);
 
     // ------------------------------------------------------------------------
     //  Liquidation
     // ------------------------------------------------------------------------
 
-    function liquidate(
-        address owner,
-        string calldata stockSymbol,
-        uint256 xStockAmount,
-        uint256 minCollateralOut
-    ) external returns (uint256 collateralSeized, uint256 liquidationFee);
+    function liquidate(address owner, string calldata stockSymbol, uint256 xStockAmount, uint256 minCollateralOut)
+        external
+        returns (uint256 collateralSeized, uint256 liquidationFee);
 
     // ------------------------------------------------------------------------
     //  View — Stock Information
     // ------------------------------------------------------------------------
 
-    function getStockInfo(string calldata stockSymbol)
+    function getStockInfo(string calldata stockSymbol) external view returns (StockInfo memory info);
+
+    function getStockPrice(string calldata stockSymbol) external view returns (uint256 price, uint256 updatedAt);
+
+    function getCollateralRequirement(string calldata stockSymbol, uint256 amount)
         external
         view
-        returns (StockInfo memory info);
+        returns (uint256 collateralNeeded);
 
-    function getStockPrice(string calldata stockSymbol)
-        external
-        view
-        returns (uint256 price, uint256 updatedAt);
+    function isStockSupported(string calldata stockSymbol) external view returns (bool isSupported);
 
-    function getCollateralRequirement(
-        string calldata stockSymbol,
-        uint256 amount
-    ) external view returns (uint256 collateralNeeded);
-
-    function isStockSupported(string calldata stockSymbol)
-        external
-        view
-        returns (bool isSupported);
-
-    function getSupportedStocks()
-        external
-        view
-        returns (string[] memory symbols);
+    function getSupportedStocks() external view returns (string[] memory symbols);
 
     function stockCount() external view returns (uint256 count);
 
@@ -554,42 +487,32 @@ interface IXStocksProtocol {
     //  View — Positions
     // ------------------------------------------------------------------------
 
-    function xStockBalanceOf(address owner, string calldata stockSymbol)
+    function xStockBalanceOf(address owner, string calldata stockSymbol) external view returns (uint256 balance);
+
+    function getXStockSupply(string calldata stockSymbol) external view returns (uint256 supply);
+
+    function getPositionHealthFactor(address owner, string calldata stockSymbol)
         external
         view
-        returns (uint256 balance);
+        returns (uint256 healthFactor);
 
-    function getXStockSupply(string calldata stockSymbol)
+    function getPositionSnapshot(address owner, string calldata stockSymbol)
         external
         view
-        returns (uint256 supply);
+        returns (PositionSnapshot memory snapshot);
 
-    function getPositionHealthFactor(
-        address owner,
-        string calldata stockSymbol
-    ) external view returns (uint256 healthFactor);
-
-    function getPositionSnapshot(
-        address owner,
-        string calldata stockSymbol
-    ) external view returns (PositionSnapshot memory snapshot);
-
-    function getUserPositions(address owner)
-        external
-        view
-        returns (PositionSnapshot[] memory snapshots);
+    function getUserPositions(address owner) external view returns (PositionSnapshot[] memory snapshots);
 
     /// @notice Paginated positions for a user (gas-efficient).
-    function getUserPositionsPaginated(
-        address owner,
-        uint256 offset,
-        uint256 limit
-    ) external view returns (PositionSnapshot[] memory snapshots, uint256 total);
+    function getUserPositionsPaginated(address owner, uint256 offset, uint256 limit)
+        external
+        view
+        returns (PositionSnapshot[] memory snapshots, uint256 total);
 
-    function isPositionLiquidatable(
-        address owner,
-        string calldata stockSymbol
-    ) external view returns (bool isLiquidatable);
+    function isPositionLiquidatable(address owner, string calldata stockSymbol)
+        external
+        view
+        returns (bool isLiquidatable);
 
     // ------------------------------------------------------------------------
     //  View — Collateral
@@ -698,29 +621,19 @@ interface IXStocksProtocol {
 
 /// @title IXStocksVault — Vault-specific extension for multi-strategy allocation.
 interface IXStocksVault is IXStocksProtocol {
-    function vaultMintXStock(
-        string calldata stockSymbol,
-        uint256 amount,
-        uint256 maxCollateral
-    ) external returns (uint256 collateralUsed);
-
-    function vaultRedeemXStock(
-        string calldata stockSymbol,
-        uint256 amount,
-        uint256 minCollateral
-    ) external returns (uint256 collateralOut);
-
-    function vaultXStockBalance(string calldata stockSymbol)
+    function vaultMintXStock(string calldata stockSymbol, uint256 amount, uint256 maxCollateral)
         external
-        view
-        returns (uint256 balance);
+        returns (uint256 collateralUsed);
+
+    function vaultRedeemXStock(string calldata stockSymbol, uint256 amount, uint256 minCollateral)
+        external
+        returns (uint256 collateralOut);
+
+    function vaultXStockBalance(string calldata stockSymbol) external view returns (uint256 balance);
 
     function vaultXStockExposureBps() external view returns (uint256 exposureBps);
     function vaultCollateralInProtocol(address asset) external view returns (uint256 amount);
     function vaultXStockHealthFactor() external view returns (uint256 healthFactor);
 
-    function rebalanceXStockPositions(
-        string[] calldata stockSymbols,
-        uint256[] calldata targetWeights
-    ) external;
+    function rebalanceXStockPositions(string[] calldata stockSymbols, uint256[] calldata targetWeights) external;
 }

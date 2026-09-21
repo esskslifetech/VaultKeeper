@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {IStockPriceFeed} from "./interfaces/IVaultKeeper.sol";
+import { IStockPriceFeed } from "./interfaces/IVaultKeeper.sol";
 
 contract MockPriceFeed is IStockPriceFeed {
     mapping(address => uint256) public price;

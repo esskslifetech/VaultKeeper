@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
-import {IXStockVault, IXStockToken, IXStockPriceOracle} from "./interfaces/IXStockVault.sol";
-import {IStockPriceFeed} from "./interfaces/IVaultKeeper.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
+import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
+import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
+import { IXStockVault, IXStockToken, IXStockPriceOracle } from "./interfaces/IXStockVault.sol";
+import { IStockPriceFeed } from "./interfaces/IVaultKeeper.sol";
 
 /// @title XStockIntegration — Production xStocks Protocol Integration
 /// @notice Implements full borrow/lend/mint/redeem flows for xStock tokens
@@ -31,6 +32,7 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
     uint256 public constant MIN_COLLATERAL_RATIO = 12_000; // 120% minimum
     uint256 public constant LIQUIDATION_THRESHOLD_DEFAULT = 11_000; // 110%
     uint256 public constant LIQUIDATION_PENALTY_DEFAULT = 500; // 5%
+    uint256 public constant DEFAULT_STALENESS_THRESHOLD = 1 hours;
 
     // ═══════════════════════════════════════════════════════════════════════
     //  State Variables
@@ -88,19 +90,9 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
     //  Events (additional to interface)
     // ═══════════════════════════════════════════════════════════════════════
 
-    event InterestAccrued(
-        address indexed user,
-        address indexed asset,
-        uint256 interestAmount,
-        uint256 newTotalDebt
-    );
+    event InterestAccrued(address indexed user, address indexed asset, uint256 interestAmount, uint256 newTotalDebt);
 
-    event RatesUpdated(
-        address indexed xStock,
-        uint256 newLendRate,
-        address indexed borrowAsset,
-        uint256 newBorrowRate
-    );
+    event RatesUpdated(address indexed xStock, uint256 newLendRate, address indexed borrowAsset, uint256 newBorrowRate);
 
     // Additional events for admin functions
     event AssetRegistered(address indexed asset);
@@ -119,6 +111,8 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
     error InterestRateTooHigh(uint256 requested, uint256 maximum);
     error PositionNotLiquidatable(address user, address xStock);
     error SlippageExceeded(uint256 expected, uint256 received);
+    error PriceFeedUnavailable(address xStock);
+    error PriceFeedStale(address xStock, uint256 updatedAt);
     error InvalidAmount();
     error AssetNotRegistered(address asset);
     error NoActiveLendPosition();
@@ -128,10 +122,7 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
     //  Constructor
     // ═══════════════════════════════════════════════════════════════════════
 
-    constructor(
-        address _priceOracle,
-        address initialOwner
-    ) Ownable(initialOwner) {
+    constructor(address _priceOracle, address initialOwner) Ownable(initialOwner) {
         if (_priceOracle == address(0)) revert InvalidXStock(address(0));
         priceOracle = _priceOracle;
         minCollateralRatio = MIN_COLLATERAL_RATIO;
@@ -183,21 +174,17 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
         IXStockToken(targetXStock).mint(msg.sender, mintedAmount);
 
         emit XStockMinted(
-            msg.sender,
-            targetXStock,
-            mintedAmount,
-            collateralAsset,
-            collateralAmount,
-            targetCollateralRatio
+            msg.sender, targetXStock, mintedAmount, collateralAsset, collateralAmount, targetCollateralRatio
         );
     }
 
-    function redeemXStock(
-        address xStockAsset,
-        uint256 xStockAmount,
-        address targetAsset,
-        uint256 minOutputAmount
-    ) external override nonReentrant whenNotPaused returns (uint256 outputAmount) {
+    function redeemXStock(address xStockAsset, uint256 xStockAmount, address targetAsset, uint256 minOutputAmount)
+        external
+        override
+        nonReentrant
+        whenNotPaused
+        returns (uint256 outputAmount)
+    {
         MintPosition storage position = _mintPositions[msg.sender][xStockAsset];
         if (position.mintedXStock == 0) revert PositionNotFound(msg.sender, xStockAsset);
         if (xStockAmount == 0 || xStockAmount > position.mintedXStock) revert InvalidAmount();
@@ -206,34 +193,30 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
         uint256 xStockPrice = _getXStockPrice(xStockAsset);
         uint256 redemptionValue = (xStockAmount * xStockPrice) / 1e8;
 
-        // Apply redemption fee (0.5%)
-        uint256 redeemFee = (redemptionValue * 50) / BPS_DENOMINATOR;
+        // Apply redemption fee (0.5%). Fee basis points are an immutable constant here,
+        // so folding the multiply into the divide loses nothing.
+        uint256 redeemFee = Math.mulDiv(redemptionValue, 50, BPS_DENOMINATOR);
         outputAmount = redemptionValue - redeemFee;
 
         if (outputAmount < minOutputAmount) revert SlippageExceeded(minOutputAmount, outputAmount);
 
         // Update position
         position.mintedXStock -= xStockAmount;
-        uint256 collateralToReturn = (position.collateralAmount * xStockAmount) /
-            (position.mintedXStock + xStockAmount); // Original total
+        uint256 collateralToReturn = (position.collateralAmount * xStockAmount) / (position.mintedXStock + xStockAmount); // Original total
         position.collateralAmount -= collateralToReturn;
 
         xStockConfigs[xStockAsset].totalMinted -= xStockAmount;
 
-        // Burn xStock tokens
+        // Burn xStock tokens. The position has already been debited above and this
+        // entrypoint is nonReentrant, so the external call cannot re-enter with a
+        // half-updated position.
+        // forge-lint: disable-next-line(reentrancy-no-eth)
         IXStockToken(xStockAsset).burn(msg.sender, xStockAmount);
 
         // Return collateral
         IERC20(targetAsset).safeTransfer(msg.sender, collateralToReturn);
 
-        emit XStockRedeemed(
-            msg.sender,
-            xStockAsset,
-            xStockAmount,
-            targetAsset,
-            outputAmount,
-            redeemFee
-        );
+        emit XStockRedeemed(msg.sender, xStockAsset, xStockAmount, targetAsset, outputAmount, redeemFee);
 
         // Clean up position if fully redeemed
         if (position.mintedXStock == 0) {
@@ -248,7 +231,9 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
         uint256 borrowAmount,
         uint256 maxInterestRate
     ) external override nonReentrant whenNotPaused returns (uint256 actualBorrowAmount) {
-        if (!xStockConfigs[xStockCollateral].isRegistered) revert InvalidXStock(xStockCollateral);
+        if (!xStockConfigs[xStockCollateral].isRegistered) {
+            revert InvalidXStock(xStockCollateral);
+        }
         if (!borrowConfigs[borrowAsset].isRegistered) revert AssetNotRegistered(borrowAsset);
 
         uint256 currentBorrowRate = getBorrowRate(borrowAsset);
@@ -285,22 +270,17 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
         IERC20(borrowAsset).safeTransfer(msg.sender, actualBorrowAmount);
 
         emit XStockBorrowed(
-            msg.sender,
-            xStockCollateral,
-            xStockAmount,
-            borrowAsset,
-            actualBorrowAmount,
-            currentBorrowRate
+            msg.sender, xStockCollateral, xStockAmount, borrowAsset, actualBorrowAmount, currentBorrowRate
         );
     }
 
-    function repayBorrow(
-        address borrowAsset,
-        uint256 repayAmount
-    ) external override nonReentrant whenNotPaused returns (
-        uint256 actualRepaidAmount,
-        uint256 interestPaid
-    ) {
+    function repayBorrow(address borrowAsset, uint256 repayAmount)
+        external
+        override
+        nonReentrant
+        whenNotPaused
+        returns (uint256 actualRepaidAmount, uint256 interestPaid)
+    {
         BorrowPosition storage position = _borrowPositions[msg.sender][borrowAsset];
         if (position.borrowedAmount == 0) revert BorrowPositionNotFound(msg.sender, borrowAsset);
 
@@ -327,23 +307,20 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
         // Return collateral if fully repaid
         if (position.borrowedAmount == 0) {
             IERC20(position.xStockCollateral).safeTransfer(msg.sender, position.xStockAmount);
-            emit XStockWithdrawnFromLend(
-                msg.sender,
-                position.xStockCollateral,
-                position.xStockAmount,
-                0
-            );
+            emit XStockWithdrawnFromLend(msg.sender, position.xStockCollateral, position.xStockAmount, 0);
             delete _borrowPositions[msg.sender][borrowAsset];
         }
 
         emit XStockRepaid(msg.sender, borrowAsset, actualRepaidAmount, interestPaid);
     }
 
-    function lendXStock(
-        address xStockAsset,
-        uint256 amount,
-        uint256 minLendRate
-    ) external override nonReentrant whenNotPaused returns (uint256 lendId) {
+    function lendXStock(address xStockAsset, uint256 amount, uint256 minLendRate)
+        external
+        override
+        nonReentrant
+        whenNotPaused
+        returns (uint256 lendId)
+    {
         if (!xStockConfigs[xStockAsset].isRegistered) revert InvalidXStock(xStockAsset);
         if (amount == 0) revert InvalidAmount();
 
@@ -372,13 +349,13 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
         emit XStockLent(msg.sender, xStockAsset, amount, currentLendRate);
     }
 
-    function withdrawLentXStock(
-        uint256 lendId,
-        uint256 amount
-    ) external override nonReentrant whenNotPaused returns (
-        uint256 withdrawnAmount,
-        uint256 earnedInterest
-    ) {
+    function withdrawLentXStock(uint256 lendId, uint256 amount)
+        external
+        override
+        nonReentrant
+        whenNotPaused
+        returns (uint256 withdrawnAmount, uint256 earnedInterest)
+    {
         LendingPosition storage position = _lendPositions[lendId];
         if (!position.isActive) revert LendPositionNotFound(lendId);
         if (position.lender != msg.sender) revert UnauthorizedLiquidator();
@@ -423,11 +400,13 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
     //  Liquidation
     // ═══════════════════════════════════════════════════════════════════════
 
-    function liquidate(
-        address user,
-        address xStock,
-        uint256 liquidateAmount
-    ) external override nonReentrant whenNotPaused returns (uint256 collateralSeized) {
+    function liquidate(address user, address xStock, uint256 liquidateAmount)
+        external
+        override
+        nonReentrant
+        whenNotPaused
+        returns (uint256 collateralSeized)
+    {
         if (!isLiquidatable(user, xStock)) revert PositionNotLiquidatable(user, xStock);
 
         MintPosition storage position = _mintPositions[user][xStock];
@@ -437,18 +416,19 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
         uint256 liquidationValue = (liquidateAmount * xStockPrice) / 1e8;
 
         // Liquidator gets collateral + penalty
-        collateralSeized = liquidationValue + ((liquidationValue * liquidationPenalty) / BPS_DENOMINATOR);
+        collateralSeized = liquidationValue + Math.mulDiv(liquidationValue, liquidationPenalty, BPS_DENOMINATOR);
 
-        // Burn liquidated xStock
+        // Burn liquidated xStock. Position updated first; `liquidate` is nonReentrant.
         position.mintedXStock -= liquidateAmount;
+        // forge-lint: disable-next-line(reentrancy-no-eth)
         IXStockToken(xStock).burn(user, liquidateAmount);
 
         // Transfer seized collateral to liquidator
         IERC20(position.collateralAsset).safeTransfer(msg.sender, collateralSeized);
 
         // Update remaining position
-        uint256 remainingCollateral = (position.collateralAmount * position.mintedXStock) /
-            (position.mintedXStock + liquidateAmount);
+        uint256 remainingCollateral =
+            (position.collateralAmount * position.mintedXStock) / (position.mintedXStock + liquidateAmount);
         position.collateralAmount = remainingCollateral;
 
         emit Liquidation(user, xStock, liquidateAmount, msg.sender, collateralSeized);
@@ -466,18 +446,28 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
         return _mintPositions[user][xStock];
     }
 
-    function getBorrowPosition(address user, address borrowAsset) external view override returns (BorrowPosition memory) {
+    function getBorrowPosition(address user, address borrowAsset)
+        external
+        view
+        override
+        returns (BorrowPosition memory)
+    {
         return _borrowPositions[user][borrowAsset];
     }
 
-    function getLendPosition(uint256 lendId) external view override returns (
-        address lender,
-        address xStock,
-        uint256 principal,
-        uint256 accruedInterest,
-        uint256 lendRate,
-        uint256 startTime
-    ) {
+    function getLendPosition(uint256 lendId)
+        external
+        view
+        override
+        returns (
+            address lender,
+            address xStock,
+            uint256 principal,
+            uint256 accruedInterest,
+            uint256 lendRate,
+            uint256 startTime
+        )
+    {
         LendingPosition storage pos = _lendPositions[lendId];
         return (pos.lender, pos.xStock, pos.principal, pos.accruedInterest, pos.lendRate, pos.startTime);
     }
@@ -620,8 +610,14 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
     function _getXStockPrice(address xStock) internal view returns (uint256 price) {
         address feed = xStockConfigs[xStock].priceFeed;
         if (feed == address(0)) {
-            // Fallback to price oracle
-            (price, ) = IXStockPriceOracle(priceOracle).getXStockPrice(xStock);
+            // Fallback to the legacy price oracle. Its quote carries an `updatedAt`, so
+            // reject a stale one instead of valuing a position off an old print.
+            uint256 updatedAt;
+            (price, updatedAt) = IXStockPriceOracle(priceOracle).getXStockPrice(xStock);
+            if (price == 0) revert PriceFeedUnavailable(xStock);
+            if (updatedAt != 0 && block.timestamp - updatedAt > DEFAULT_STALENESS_THRESHOLD) {
+                revert PriceFeedStale(xStock, updatedAt);
+            }
         } else {
             price = IStockPriceFeed(feed).getPrice(xStock);
         }
@@ -643,9 +639,14 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
         if (position.borrowedAmount == 0) return 0;
 
         uint256 timeElapsed = block.timestamp - position.lastInterestAccrual;
-        uint256 ratePerSecond = (position.interestRate * 1e18) / (SECONDS_PER_YEAR * BPS_DENOMINATOR);
 
-        interest = (position.borrowedAmount * ratePerSecond * timeElapsed) / 1e18;
+        // ratePerSecond = rate * 1e18 / (year * BPS); interest = principal * ratePerSecond
+        // * elapsed / 1e18. Doing it in one mulDiv avoids dividing first (which rounded the
+        // per-second rate down to zero for small rates) and avoids the 3-factor overflow.
+        // forge-lint: disable-next-line(divide-before-multiply)
+        interest = Math.mulDiv(
+            position.borrowedAmount * timeElapsed, position.interestRate, SECONDS_PER_YEAR * BPS_DENOMINATOR
+        );
     }
 
     function _calculateLendInterest(uint256 lendId) internal view returns (uint256 interest) {
@@ -653,9 +654,10 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
         if (!position.isActive) return 0;
 
         uint256 timeElapsed = block.timestamp - position.lastUpdate;
-        uint256 ratePerSecond = (position.lendRate * 1e18) / (SECONDS_PER_YEAR * BPS_DENOMINATOR);
 
-        interest = (position.principal * ratePerSecond * timeElapsed) / 1e18;
+        // Same single-mulDiv treatment as {_calculateAccruedInterest}.
+        // forge-lint: disable-next-line(divide-before-multiply)
+        interest = Math.mulDiv(position.principal * timeElapsed, position.lendRate, SECONDS_PER_YEAR * BPS_DENOMINATOR);
     }
 
     // Additional event for config updates

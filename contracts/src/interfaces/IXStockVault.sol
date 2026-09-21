@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { IERC4626 } from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
 /// @title IXStockVault — Interface for Tokenized Stock (xStock) Integration
 /// @notice Defines the standard interface for xStock vaults that integrate with
@@ -77,33 +77,15 @@ interface IXStockVault {
         uint256 interestRate
     );
 
-    event XStockRepaid(
-        address indexed user,
-        address indexed borrowedAsset,
-        uint256 repaidAmount,
-        uint256 interestPaid
-    );
+    event XStockRepaid(address indexed user, address indexed borrowedAsset, uint256 repaidAmount, uint256 interestPaid);
 
-    event XStockLent(
-        address indexed lender,
-        address indexed xStock,
-        uint256 amount,
-        uint256 lendRate
-    );
+    event XStockLent(address indexed lender, address indexed xStock, uint256 amount, uint256 lendRate);
 
     event XStockWithdrawnFromLend(
-        address indexed lender,
-        address indexed xStock,
-        uint256 amount,
-        uint256 earnedInterest
+        address indexed lender, address indexed xStock, uint256 amount, uint256 earnedInterest
     );
 
-    event CollateralRatioUpdated(
-        address indexed user,
-        address indexed xStock,
-        uint256 oldRatio,
-        uint256 newRatio
-    );
+    event CollateralRatioUpdated(address indexed user, address indexed xStock, uint256 oldRatio, uint256 newRatio);
 
     event Liquidation(
         address indexed user,
@@ -138,12 +120,9 @@ interface IXStockVault {
     /// @param targetAsset The asset to receive (can be collateral or different asset)
     /// @param minOutputAmount Minimum output amount (slippage protection)
     /// @return outputAmount The actual amount received
-    function redeemXStock(
-        address xStockAsset,
-        uint256 xStockAmount,
-        address targetAsset,
-        uint256 minOutputAmount
-    ) external returns (uint256 outputAmount);
+    function redeemXStock(address xStockAsset, uint256 xStockAmount, address targetAsset, uint256 minOutputAmount)
+        external
+        returns (uint256 outputAmount);
 
     /// @notice Borrow assets using xStock as collateral
     /// @param xStockCollateral The xStock token to use as collateral
@@ -165,31 +144,25 @@ interface IXStockVault {
     /// @param repayAmount Amount to repay (use type(uint256).max for full repayment)
     /// @return actualRepaidAmount The actual amount repaid including accrued interest
     /// @return interestPaid The interest portion of the repayment
-    function repayBorrow(
-        address borrowAsset,
-        uint256 repayAmount
-    ) external returns (uint256 actualRepaidAmount, uint256 interestPaid);
+    function repayBorrow(address borrowAsset, uint256 repayAmount)
+        external
+        returns (uint256 actualRepaidAmount, uint256 interestPaid);
 
     /// @notice Lend xStock tokens to earn yield from borrowers
     /// @param xStockAsset The xStock token to lend
     /// @param amount Amount to lend
     /// @param minLendRate Minimum acceptable lending rate in bps
     /// @return lendId Unique identifier for the lending position
-    function lendXStock(
-        address xStockAsset,
-        uint256 amount,
-        uint256 minLendRate
-    ) external returns (uint256 lendId);
+    function lendXStock(address xStockAsset, uint256 amount, uint256 minLendRate) external returns (uint256 lendId);
 
     /// @notice Withdraw lent xStock tokens plus earned interest
     /// @param lendId The lending position ID
     /// @param amount Amount to withdraw (use type(uint256).max for full withdrawal)
     /// @return withdrawnAmount The amount withdrawn
     /// @return earnedInterest The interest earned
-    function withdrawLentXStock(
-        uint256 lendId,
-        uint256 amount
-    ) external returns (uint256 withdrawnAmount, uint256 earnedInterest);
+    function withdrawLentXStock(uint256 lendId, uint256 amount)
+        external
+        returns (uint256 withdrawnAmount, uint256 earnedInterest);
 
     // ═══════════════════════════════════════════════════════════════════════
     //  View Functions
@@ -202,14 +175,17 @@ interface IXStockVault {
     function getBorrowPosition(address user, address borrowAsset) external view returns (BorrowPosition memory);
 
     /// @notice Get lending position details
-    function getLendPosition(uint256 lendId) external view returns (
-        address lender,
-        address xStock,
-        uint256 principal,
-        uint256 accruedInterest,
-        uint256 lendRate,
-        uint256 startTime
-    );
+    function getLendPosition(uint256 lendId)
+        external
+        view
+        returns (
+            address lender,
+            address xStock,
+            uint256 principal,
+            uint256 accruedInterest,
+            uint256 lendRate,
+            uint256 startTime
+        );
 
     /// @notice Calculate collateral ratio for a position
     function getCollateralRatio(address user, address xStock) external view returns (uint256 ratioBps);
@@ -250,11 +226,9 @@ interface IXStockVault {
     /// @param xStock The xStock token in the position
     /// @param liquidateAmount Amount of xStock debt to liquidate
     /// @return collateralSeized Amount of collateral seized by liquidator
-    function liquidate(
-        address user,
-        address xStock,
-        uint256 liquidateAmount
-    ) external returns (uint256 collateralSeized);
+    function liquidate(address user, address xStock, uint256 liquidateAmount)
+        external
+        returns (uint256 collateralSeized);
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Administration

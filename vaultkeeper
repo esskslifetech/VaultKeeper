@@ -34,8 +34,11 @@ check_anvil() {
 cmd_dev() {
     log_info "Starting VaultKeeper development environment..."
     
-    # Check if already running
-    if [ -f "$PID_DIR/anvil.pid" ] && kill -0 "$(cat "$PID_DIR/anvil.pid")" 2>/dev/null; then
+    # Check if already running (an untracked node on the port counts as running too -
+    # otherwise a second Anvil would fail to bind while this script reported success)
+    if check_anvil; then
+        log_warn "Anvil is already running on port 8545"
+    elif [ -f "$PID_DIR/anvil.pid" ] && kill -0 "$(cat "$PID_DIR/anvil.pid")" 2>/dev/null; then
         log_warn "Anvil is already running"
     else
         # Start Anvil
@@ -64,6 +67,10 @@ cmd_dev() {
     if [ "${1:-}" = "--deploy" ] || [ ! -f "$SCRIPT_DIR/contracts/broadcast/Deploy.s.sol/31337/run-latest.json" ]; then
         log_info "Deploying contracts..."
         cd "$SCRIPT_DIR/contracts"
+
+        # Anvil's well-known first account. `--private-key` alone is not enough: the
+        # script reads PRIVATE_KEY from the environment to derive the deployer address.
+        PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
         forge script script/Deploy.s.sol \
             --rpc-url http://localhost:8545 \
             --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
@@ -79,25 +86,31 @@ cmd_dev() {
         log_info "Contracts already deployed (use --deploy to redeploy)"
     fi
     
-    # Start frontend
-    if [ -f "$PID_DIR/frontend.pid" ] && kill -0 "$(cat "$PID_DIR/frontend.pid")" 2>/dev/null; then
+    # Frontend
+    # NOTE: the Next.js app is not part of this repository (see README). Only start
+    # something if a frontend is actually present, otherwise say so plainly instead of
+    # reporting a service that cannot exist.
+    if [ ! -f "$SCRIPT_DIR/web/package.json" ]; then
+        log_warn "No frontend in web/ - skipping (this repository ships contracts only)"
+    elif [ -f "$PID_DIR/frontend.pid" ] && kill -0 "$(cat "$PID_DIR/frontend.pid")" 2>/dev/null; then
         log_warn "Frontend is already running on http://localhost:3000"
     else
         log_info "Starting frontend on http://localhost:3000..."
-        cd "$SCRIPT_DIR/web"
-        npm run dev > "$LOG_DIR/frontend.log" 2>&1 &
+        ( cd "$SCRIPT_DIR/web" && npm run dev ) > "$LOG_DIR/frontend.log" 2>&1 &
         echo $! > "$PID_DIR/frontend.pid"
         log_success "Frontend started"
     fi
-    
+
     echo ""
-    log_success "🚀 VaultKeeper is running!"
-    echo "  • Anvil:      http://127.0.0.1:8545"
-    echo "  • Frontend:   http://localhost:3000"
-    echo "  • Dashboard:  http://localhost:3000/dashboard"
-    echo "  • Strategy:   http://localhost:3000/dashboard/strategy"
+    log_success "VaultKeeper development environment is up"
+    echo "  • Anvil:      http://127.0.0.1:8545 (chain id 31337)"
+    echo "  • Manifest:   contracts/deployments/31337.json"
+    if [ -f "$SCRIPT_DIR/web/package.json" ]; then
+        echo "  • Frontend:   http://localhost:3000"
+    fi
     echo ""
     log_info "Commands:"
+    echo "  ./vaultkeeper deploy  - (Re)deploy contracts to Anvil"
     echo "  ./vaultkeeper logs    - View all logs"
     echo "  ./vaultkeeper stop    - Stop all services"
     echo "  ./vaultkeeper status  - Check service status"
@@ -112,6 +125,7 @@ cmd_deploy() {
     fi
     
     cd "$SCRIPT_DIR/contracts"
+    PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
     forge script script/Deploy.s.sol \
         --rpc-url http://localhost:8545 \
         --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
@@ -180,7 +194,9 @@ cmd_status() {
     fi
     
     # Frontend status
-    if [ -f "$PID_DIR/frontend.pid" ] && kill -0 "$(cat "$PID_DIR/frontend.pid")" 2>/dev/null; then
+    if [ ! -f "$SCRIPT_DIR/web/package.json" ]; then
+        log_warn "Frontend:  not in this repository"
+    elif [ -f "$PID_DIR/frontend.pid" ] && kill -0 "$(cat "$PID_DIR/frontend.pid")" 2>/dev/null; then
         log_success "Frontend:  Running ✓ (PID: $(cat "$PID_DIR/frontend.pid"), http://localhost:3000)"
     else
         log_error "Frontend:  Stopped ✗"
@@ -197,7 +213,7 @@ cmd_help() {
     echo "Usage: ./vaultkeeper [command] [options]"
     echo ""
     echo "Commands:"
-    echo "  dev [ --deploy ]   Start development environment (Anvil + Frontend)"
+    echo "  dev [ --deploy ]   Start local Anvil and deploy the contracts"
     echo "  deploy             Deploy contracts to local Anvil"
     echo "  stop               Stop all services"
     echo "  logs [service]     View logs (anvil|frontend|deploy)"
