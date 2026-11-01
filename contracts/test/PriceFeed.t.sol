@@ -504,4 +504,75 @@ contract PriceFeedTest is Test {
         }
         assertEq(filled, 10, "ring buffer full");
     }
+
+    function test_review_old_observation_cannot_be_refreshed() public {
+        cl1.setWithTime(200e8, block.timestamp - 7200);
+        feed.addSource(asset, address(cl1), PriceFeed.SourceType.Chainlink, 10000, bytes32(0));
+        vm.expectRevert(abi.encodeWithSelector(PriceFeed.NoValidSources.selector, asset));
+        feed.updatePrice(asset);
+    }
+
+    function test_review_pyth_age_survives_cache_and_mixed_sources_use_oldest() public {
+        uint256 oldest = block.timestamp - 3599;
+        pyth.setPrice(PYTH_ID, 200e8, 0, -8, uint64(bound(oldest, 1, type(uint64).max)));
+        cl1.set(200e8);
+        feed.addSource(asset, address(pyth), PriceFeed.SourceType.Pyth, 5000, PYTH_ID);
+        feed.addSource(asset, address(cl1), PriceFeed.SourceType.Chainlink, 5000, bytes32(0));
+        feed.updatePrice(asset);
+        (uint256 observedAt, uint256 validUntil) = feed.priceValidity(asset);
+        assertEq(observedAt, oldest);
+        assertEq(validUntil, oldest + 3600);
+        assertGt(feed.lastUpdate(asset), observedAt, "ingestion time is distinct");
+        vm.warp(block.timestamp + 2);
+        // An unusable source must not launder the old aggregate by dropping it and
+        // re-adopting the remaining fresh source as a new observation.
+        cl1.setWithTime(200e8, block.timestamp - 7200);
+        vm.expectRevert();
+        feed.updatePrice(asset);
+        assertFalse(feed.isPriceFresh(asset));
+        vm.expectRevert();
+        feed.getPrice(asset);
+    }
+
+    function test_review_future_source_timestamps_rejected() public {
+        cl1.setWithTime(200e8, block.timestamp + 1);
+        feed.addSource(asset, address(cl1), PriceFeed.SourceType.Chainlink, 10000, bytes32(0));
+        vm.expectRevert();
+        feed.updatePrice(asset);
+        pyth.setPrice(PYTH_ID, 200e8, 0, -8, uint64(block.timestamp + 1));
+        feed.addSource(asset, address(pyth), PriceFeed.SourceType.Pyth, 10000, PYTH_ID);
+        vm.expectRevert();
+        feed.updatePrice(asset);
+    }
+
+    function test_review_asset_policy_is_shared_and_cannot_extend_adopted_expiry() public {
+        cl1.set(200e8);
+        feed.addSource(asset, address(cl1), PriceFeed.SourceType.Chainlink, 10000, bytes32(0));
+        feed.setAssetStaleness(asset, 60);
+        feed.updatePrice(asset);
+        uint256 expiry = block.timestamp + 60;
+        feed.setAssetStaleness(asset, 7200);
+        (, uint256 validUntil) = feed.priceValidity(asset);
+        assertEq(validUntil, expiry, "policy extension does not revive an observation");
+        vm.warp(expiry + 1);
+        assertFalse(feed.isPriceFresh(asset));
+        vm.expectRevert();
+        feed.getPrice(asset);
+    }
+
+    function test_review_pause_and_override_have_explicit_validity() public {
+        feed.overridePrice(asset, 200e8, "manual observation");
+        (uint256 observedAt, uint256 expiry) = feed.priceValidity(asset);
+        assertEq(observedAt, block.timestamp);
+        assertEq(expiry, block.timestamp + 3600);
+        assertEq(feed.getPriceData(asset).sourceCount, 0, "override distinguished from aggregation");
+        feed.pause("maintenance");
+        assertFalse(feed.isPriceFresh(asset));
+        vm.expectRevert(PriceFeed.ContractPaused.selector);
+        feed.getPrice(asset);
+        vm.warp(expiry + 1);
+        feed.unpause();
+        vm.expectRevert();
+        feed.getPrice(asset);
+    }
 }

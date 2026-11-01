@@ -15,10 +15,15 @@ interface IStockPriceFeed {
     /// @dev MUST revert if no usable price exists. Consumers rely on this.
     function getPrice(address asset) external view returns (uint256 price);
 
-    /// @notice Timestamp of the last successful price update for `asset`.
+    /// @notice Cache-write timestamp, NOT necessarily the underlying observation time.
     function lastUpdate(address asset) external view returns (uint256 updatedAt);
 
-    /// @notice Maximum age, in seconds, that a price may have before it is stale.
+    /// @notice Original observation time and inclusive expiry preserved through caching.
+    /// @dev Consumers must check this asset-specific window rather than cache-write age.
+    ///      Both values are zero when no observation has been adopted.
+    function priceValidity(address asset) external view returns (uint256 observedAt, uint256 validUntil);
+
+    /// @notice Legacy global age setting. Use {priceValidity} for an asset's actual policy.
     function stalenessThreshold() external view returns (uint256);
 
     /// @notice True when `asset` has a non-zero, non-stale price.
@@ -41,6 +46,9 @@ enum TransferMode {
 }
 
 interface IVaultKeeper {
+    error StrategyAssetNotEmpty(address asset);
+    error ReservedCash(uint256 available, uint256 reserved);
+
     // ────────────────────────────────────────────────────────────────────────
     //  Structs
     // ────────────────────────────────────────────────────────────────────────

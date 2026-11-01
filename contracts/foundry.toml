@@ -23,16 +23,12 @@ bracket_spacing = true
 int_types = "long"
 
 [lint]
-# Foundry's default severity set (high/medium/low) flags several patterns that are
-# intentional in a strategy v0.9.0 vault. Everything not listed here is either fixed or
-# annotated inline with `// forge-lint: disable-next-line(...)` plus a reason.
+# Foundry 1.7.1 lint IDs. Timestamp comparisons are intentional in this keeper;
+# unchecked transfer warnings are confined to tests that assert the transfer outcome.
+# Production token movements use SafeERC20. Other findings must remain visible.
 exclude_lints = [
-  "calls-loop",             # strategy/source loops call out (price, balance, swap) by design
-  "require-revert-in-loop", # validation loops revert with the offending element
-  "uninitialized-local",    # false positive on `for (uint256 i; ...)` and `+=` accumulators
-  "boolean-cst",            # false positive on `return (true, payload)` / `(false, "")`
-  "block-timestamp",        # interval-driven keeper: timestamps are the feature
-  "reentrancy-events",      # events intentionally follow external calls; all mutators are nonReentrant
+  "block-timestamp",        # interval-driven keeper and oracle validity windows
+  "erc20-unchecked-transfer", # test assertions intentionally exercise share transfers
 ]
 
 [profile.ci]

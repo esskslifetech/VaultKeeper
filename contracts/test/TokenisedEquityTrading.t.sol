@@ -5,6 +5,7 @@ import { Test, console2 } from "forge-std/Test.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { IERC20Metadata } from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
+import { Bytes } from "@openzeppelin/contracts/utils/Bytes.sol";
 import { VaultKeeper } from "../src/VaultKeeper.sol";
 import { IVaultKeeper } from "../src/interfaces/IVaultKeeper.sol";
 import { PriceFeed } from "../src/PriceFeed.sol";
@@ -289,7 +290,11 @@ contract TokenisedEquityTradingTest is Test {
             // succeeds - then it must have delivered the full claimed amount.
             assertGe(IERC20(USDC).balanceOf(user), fullNav, "full redemption paid in full");
         } catch (bytes memory reason) {
-            assertEq(bytes4(reason), VaultKeeperContract.InsufficientLiquidity.selector, "short of assets");
+            assertEq(
+                Bytes.slice(reason, 0, 4),
+                abi.encodePacked(VaultKeeperContract.InsufficientLiquidity.selector),
+                "short of assets"
+            );
         }
     }
 
@@ -329,15 +334,15 @@ contract TokenisedEquityTradingTest is Test {
         IUniswapV3SwapRouterLike(UNI_V3_ROUTER)
             .exactInputSingle(
                 IUniswapV3SwapRouterLike.ExactInputSingleParams({
-                    tokenIn: USDC,
-                    tokenOut: TSLAON,
-                    fee: TIER_TSLAON,
-                    recipient: address(this),
-                    deadline: block.timestamp,
-                    amountIn: usdcIn,
-                    amountOutMinimum: 0,
-                    sqrtPriceLimitX96: 0
-                })
+                tokenIn: USDC,
+                tokenOut: TSLAON,
+                fee: TIER_TSLAON,
+                recipient: address(this),
+                deadline: block.timestamp,
+                amountIn: usdcIn,
+                amountOutMinimum: 0,
+                sqrtPriceLimitX96: 0
+            })
             );
         assertLt(bps, 10_000);
     }

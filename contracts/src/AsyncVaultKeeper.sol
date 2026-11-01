@@ -7,7 +7,7 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import { VaultKeeper } from "./VaultKeeper.sol";
-import { IVaultKeeper, IStockPriceFeed, TransferMode } from "./interfaces/IVaultKeeper.sol";
+import { IVaultKeeper } from "./interfaces/IVaultKeeper.sol";
 
 // ============================================================================
 //  AsyncVaultKeeper — ERC-7540 (asynchronous ERC-4626) vault
@@ -37,11 +37,14 @@ import { IVaultKeeper, IStockPriceFeed, TransferMode } from "./interfaces/IVault
 //      request deposit :  assets in, NAV unchanged          -> price unchanged
 //      request redeem  :  shares burned, NAV -= snapshot     -> price unchanged
 //      claim deposit   :  shares minted at the live price    -> price unchanged
-//      claim redeem    :  snapshot paid out, NAV unchanged   -> price unchanged
+//      claim redeem    :  settled cash paid, NAV unchanged  -> price unchanged
 //
-//    The depositor carries the price risk between request and claim (the standard
-//    permits this explicitly), while the redeemer's payout is fixed at request time
-//    (pending redemptions are not yield-bearing, also explicitly permitted).
+//    The depositor carries the price risk between request and claim. A redemption
+//    settles its marked entitlement into cash BEFORE fixing the payout. The request
+//    receives the realizable proceeds (marked value less venue costs), so remaining
+//    holders do not subsidize the exit. Both pending and claimable redemption cash
+//    is reserved against every cash outflow. A market move after settlement cannot
+//    reduce its backing; an illiquid exit reverts without creating a liability.
 //
 //  ERC-7540 support:
 //    • ERC-165: 0xe3bc4e65 (operators), 0xce3bbe50 (async deposit),
@@ -120,10 +123,10 @@ contract AsyncVaultKeeper is VaultKeeper, IERC165 {
         uint256 pendingAssets;
         uint256 claimableAssets;
         uint256 pendingShares;
-        /// @dev Assets owed for the pending redemption, snapshotted at request time.
+        /// @dev Realizable cash settled and reserved when the request was made.
         uint256 pendingRedeemAssets;
         uint256 claimableShares;
-        /// @dev Assets owed for the claimable redemption, snapshotted at request time.
+        /// @dev Settled cash awaiting claim; never reused by the strategy.
         uint256 claimableRedeemAssets;
     }
 
@@ -135,10 +138,10 @@ contract AsyncVaultKeeper is VaultKeeper, IERC165 {
     /// @notice Deposited assets processed and awaiting claim. Excluded from NAV.
     uint256 public totalClaimableDeposits;
 
-    /// @notice Assets owed for redemptions still waiting to be processed. Excluded from NAV.
+    /// @notice Settled cash owed for unprocessed redemptions. Excluded from NAV and reserved.
     uint256 public totalPendingRedeemAssets;
 
-    /// @notice Assets owed for redemptions awaiting claim. Excluded from NAV.
+    /// @notice Settled cash owed for redemption claims. Excluded from NAV and reserved.
     uint256 public totalClaimableRedeemAssets;
 
     // ────────────────────────────────────────────────────────────────────────
@@ -175,24 +178,19 @@ contract AsyncVaultKeeper is VaultKeeper, IERC165 {
             + totalClaimableRedeemAssets;
     }
 
-    /// @dev Advances the fee clock and refreshes the price used to convert a claim.
-    function _assessFeesBeforeClaim() internal {
-        _assessFees();
-    }
-
     // ────────────────────────────────────────────────────────────────────────
     //  Limits
     // ────────────────────────────────────────────────────────────────────────
 
-    /// @dev Requests are always accepted (subject to the pause); the *claim* is what the
-    ///      claimable amount bounds. `maxWithdraw`/`maxRedeem` therefore report the
-    ///      processed balance, per ERC-7540.
-    function maxDeposit(address) public view virtual override returns (uint256) {
-        return paused ? 0 : type(uint256).max;
+    /// @dev ERC-7540 maxima describe claim capacity, not request admission.
+    function maxDeposit(address controller) public view virtual override returns (uint256) {
+        return paused ? 0 : _requests[controller].claimableAssets;
     }
 
-    function maxMint(address) public view virtual override returns (uint256) {
-        return paused ? 0 : type(uint256).max;
+    function maxMint(address controller) public view virtual override returns (uint256) {
+        if (paused) return 0;
+        // Floor is conservative: minting these shares costs at most the available cash.
+        return _convertToShares(_requests[controller].claimableAssets, Math.Rounding.Floor);
     }
 
     function maxWithdraw(address controller) public view virtual override returns (uint256) {
@@ -224,7 +222,6 @@ contract AsyncVaultKeeper is VaultKeeper, IERC165 {
 
         // ERC-7540: the request may be placed by an approved operator; `owner` is the
         // share holder and has authorised this pull through its own ERC-20 allowance.
-        // forge-lint: disable-next-line(arbitrary-send-erc20)
         depositAsset.safeTransferFrom(owner, address(this), assets);
 
         RequestState storage req = _requests[controller];
@@ -241,8 +238,9 @@ contract AsyncVaultKeeper is VaultKeeper, IERC165 {
     }
 
     /// @notice Queues a redemption of `shares`, taken from `owner`, for `controller`.
-    /// @dev Shares are burned on request, per ERC-7540, and the payout is snapshotted at
-    ///      the price prevailing now.
+    /// @dev Fees settle first. The marked entitlement is then liquidated into reserved
+    ///      cash, and only realizable proceeds become a fixed liability. Shares burn
+    ///      after successful settlement; failed settlement leaves shares untouched.
     function requestRedeem(uint256 shares, address controller, address owner)
         external
         nonReentrant
@@ -257,7 +255,9 @@ contract AsyncVaultKeeper is VaultKeeper, IERC165 {
             _spendAllowance(owner, msg.sender, shares);
         }
 
-        uint256 assets = super.previewRedeem(shares); // price *before* the burn
+        _assessFees();
+        uint256 markedValue = super.previewRedeem(shares);
+        uint256 assets = _settleExitCash(markedValue);
 
         RequestState storage req = _requests[controller];
         if (fulfillmentMode == FulfillmentMode.INSTANT) {
@@ -296,8 +296,7 @@ contract AsyncVaultKeeper is VaultKeeper, IERC165 {
         return _requests[controller].claimableShares;
     }
 
-    /// @notice Assets owed to `controller` for its claimable redemption, snapshotted at
-    ///         request time. Required by {withdraw}-style claims.
+    /// @notice Settled, reserved cash owed for `controller`'s claimable redemption.
     function claimableRedeemAssets(address controller) external view returns (uint256 assets) {
         return _requests[controller].claimableRedeemAssets;
     }
@@ -323,39 +322,15 @@ contract AsyncVaultKeeper is VaultKeeper, IERC165 {
 
     /// @notice Processes queued deposit requests so the controllers can claim shares.
     function fulfillDeposits(address[] calldata controllers) external nonReentrant onlyKeeperOrOwner {
-        uint256 len = controllers.length;
-        for (uint256 i; i < len; ++i) {
-            address controller = controllers[i];
-            uint256 assets = _requests[controller].pendingAssets;
-            if (assets == 0) revert NothingToFulfill(controller);
-
-            _requests[controller].pendingAssets = 0;
-            _requests[controller].claimableAssets += assets;
-            totalPendingDeposits -= assets;
-            totalClaimableDeposits += assets;
-
-            emit DepositRequestFulfilled(controller, assets);
+        for (uint256 i; i < controllers.length; ++i) {
+            _fulfillDeposit(controllers[i]);
         }
     }
 
-    /// @notice Processes queued redemption requests so the controllers can claim assets.
+    /// @notice Advances already-settled redemption requests to claimable.
     function fulfillRedeems(address[] calldata controllers) external nonReentrant onlyKeeperOrOwner {
-        uint256 len = controllers.length;
-        for (uint256 i; i < len; ++i) {
-            address controller = controllers[i];
-            RequestState storage req = _requests[controller];
-            uint256 shares = req.pendingShares;
-            if (shares == 0) revert NothingToFulfill(controller);
-
-            uint256 assets = req.pendingRedeemAssets;
-            req.pendingShares = 0;
-            req.pendingRedeemAssets = 0;
-            req.claimableShares += shares;
-            req.claimableRedeemAssets += assets;
-            totalPendingRedeemAssets -= assets;
-            totalClaimableRedeemAssets += assets;
-
-            emit RedeemRequestFulfilled(controller, shares, assets);
+        for (uint256 i; i < controllers.length; ++i) {
+            _fulfillRedemption(controllers[i]);
         }
     }
 
@@ -487,31 +462,37 @@ contract AsyncVaultKeeper is VaultKeeper, IERC165 {
         emit FulfillmentModeUpdated(old, mode);
     }
 
-    /// @notice Processes the caller's own pending requests, so a user is never blocked by a
-    ///         keeper that is offline when the mode is manual.
+    /// @notice Advances the caller's requests without a keeper. Redemptions were already
+    ///         settled into reserved cash; this only changes their lifecycle state.
     function selfFulfill() external nonReentrant {
         RequestState storage req = _requests[msg.sender];
+        if (req.pendingAssets != 0) _fulfillDeposit(msg.sender);
+        if (req.pendingShares != 0) _fulfillRedemption(msg.sender);
+    }
 
-        if (req.pendingAssets != 0) {
-            uint256 assets = req.pendingAssets;
-            req.pendingAssets = 0;
-            req.claimableAssets += assets;
-            totalPendingDeposits -= assets;
-            totalClaimableDeposits += assets;
-            emit DepositRequestFulfilled(msg.sender, assets);
-        }
+    function _fulfillDeposit(address controller) internal {
+        RequestState storage req = _requests[controller];
+        uint256 assets = req.pendingAssets;
+        if (assets == 0) revert NothingToFulfill(controller);
+        req.pendingAssets = 0;
+        req.claimableAssets += assets;
+        totalPendingDeposits -= assets;
+        totalClaimableDeposits += assets;
+        emit DepositRequestFulfilled(controller, assets);
+    }
 
-        if (req.pendingShares != 0) {
-            uint256 shares = req.pendingShares;
-            uint256 assets = req.pendingRedeemAssets;
-            req.pendingShares = 0;
-            req.pendingRedeemAssets = 0;
-            req.claimableShares += shares;
-            req.claimableRedeemAssets += assets;
-            totalPendingRedeemAssets -= assets;
-            totalClaimableRedeemAssets += assets;
-            emit RedeemRequestFulfilled(msg.sender, shares, assets);
-        }
+    function _fulfillRedemption(address controller) internal {
+        RequestState storage req = _requests[controller];
+        uint256 shares = req.pendingShares;
+        if (shares == 0) revert NothingToFulfill(controller);
+        uint256 assets = req.pendingRedeemAssets;
+        req.pendingShares = 0;
+        req.pendingRedeemAssets = 0;
+        req.claimableShares += shares;
+        req.claimableRedeemAssets += assets;
+        totalPendingRedeemAssets -= assets;
+        totalClaimableRedeemAssets += assets;
+        emit RedeemRequestFulfilled(controller, shares, assets);
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -532,7 +513,7 @@ contract AsyncVaultKeeper is VaultKeeper, IERC165 {
         uint256 available = req.claimableAssets;
         if (assets == 0 || assets > available) revert InsufficientClaimable(controller, assets, available);
 
-        _assessFeesBeforeClaim();
+        _assessFees();
 
         // Price the shares while the claim amount is still excluded from NAV: the
         // depositor buys in at the price prevailing *before* their own assets join the
@@ -555,7 +536,7 @@ contract AsyncVaultKeeper is VaultKeeper, IERC165 {
     function _claimMint(uint256 shares, address receiver, address controller) internal returns (uint256 assets) {
         if (shares == 0) revert ZeroAmount();
 
-        _assessFeesBeforeClaim();
+        _assessFees();
         assets = super.previewMint(shares);
 
         RequestState storage req = _requests[controller];
@@ -572,8 +553,7 @@ contract AsyncVaultKeeper is VaultKeeper, IERC165 {
         emit Deposit(controller, receiver, assets, shares);
     }
 
-    /// @dev Pays a claimable redemption. Shares were burned at request time, so this is a
-    ///      pure asset movement bounded by the amount snapshotted then.
+    /// @dev Pays only cash already settled and reserved for this controller.
     function _claimWithdraw(uint256 assets, address receiver, address controller) internal returns (uint256 shares) {
         RequestState storage req = _requests[controller];
         uint256 availableAssets = req.claimableRedeemAssets;
@@ -581,24 +561,13 @@ contract AsyncVaultKeeper is VaultKeeper, IERC165 {
             revert InsufficientClaimable(controller, assets, availableAssets);
         }
 
-        uint256 availableShares = req.claimableShares;
         shares = assets == availableAssets
-            ? availableShares
-            : Math.mulDiv(assets, availableShares, availableAssets, Math.Rounding.Ceil);
-
-        req.claimableRedeemAssets = availableAssets - assets;
-        req.claimableShares = availableShares - shares;
-        totalClaimableRedeemAssets -= assets;
-
-        _ensureLiquidity(assets);
-        depositAsset.safeTransfer(receiver, assets);
-        totalWithdrawn += assets;
-
-        emit Withdraw(controller, receiver, controller, assets, shares);
+            ? req.claimableShares
+            : Math.mulDiv(assets, req.claimableShares, availableAssets, Math.Rounding.Ceil);
+        _payRedemption(req, receiver, controller, assets, shares);
     }
 
-    /// @dev Pays a claimable redemption by share count. The payout is fixed at request time,
-    ///      so this is not the live `convertToAssets`.
+    /// @dev Pays settled cash by share count, not at the live `convertToAssets` price.
     function _claimRedeem(uint256 shares, address receiver, address controller) internal returns (uint256 assets) {
         RequestState storage req = _requests[controller];
         uint256 availableShares = req.claimableShares;
@@ -608,15 +577,21 @@ contract AsyncVaultKeeper is VaultKeeper, IERC165 {
 
         uint256 availableAssets = req.claimableRedeemAssets;
         assets = shares == availableShares ? availableAssets : Math.mulDiv(shares, availableAssets, availableShares);
+        _payRedemption(req, receiver, controller, assets, shares);
+    }
 
-        req.claimableShares = availableShares - shares;
-        req.claimableRedeemAssets = availableAssets - assets;
+    function _payRedemption(
+        RequestState storage req,
+        address receiver,
+        address controller,
+        uint256 assets,
+        uint256 shares
+    ) internal {
+        req.claimableShares -= shares;
+        req.claimableRedeemAssets -= assets;
         totalClaimableRedeemAssets -= assets;
-
-        _ensureLiquidity(assets);
         depositAsset.safeTransfer(receiver, assets);
         totalWithdrawn += assets;
-
         emit Withdraw(controller, receiver, controller, assets, shares);
     }
 }

@@ -464,6 +464,8 @@ contract VaultKeeperTest is Test {
         uint256 ppsBefore = vault.previewRedeem(10 ** vault.decimals());
 
         vm.warp(block.timestamp + 365 days);
+        feed.setPrice(address(aapl), 200e18);
+        feed.setPrice(address(msft), 300e18);
         vm.prank(user);
         vault.deposit(1e6, user); // any user flow runs _assessFees()
 
@@ -488,6 +490,8 @@ contract VaultKeeperTest is Test {
         vault.deposit(1_000_000e6, user);
 
         vm.warp(block.timestamp + 365 days);
+        feed.setPrice(address(aapl), 200e18);
+        feed.setPrice(address(msft), 300e18);
         vm.prank(user);
         vault.deposit(1e6, user);
 
@@ -549,6 +553,8 @@ contract VaultKeeperTest is Test {
         vault.deposit(1_000_000e6, user);
 
         vm.warp(block.timestamp + 365 days);
+        feed.setPrice(address(aapl), 200e18);
+        feed.setPrice(address(msft), 300e18);
         vm.prank(user);
         vault.deposit(1e6, user); // accrue
 
@@ -724,7 +730,9 @@ contract VaultKeeperTest is Test {
         vm.warp(t0 + 366 days);
 
         vm.expectRevert(
-            abi.encodeWithSelector(VaultKeeper.StalePrice.selector, address(aapl), block.timestamp - 366 days, 365 days)
+            abi.encodeWithSelector(
+                VaultKeeper.StalePrice.selector, address(aapl), block.timestamp - 366 days, block.timestamp - 1 days
+            )
         );
         vault.totalAssets();
     }
@@ -754,5 +762,132 @@ contract VaultKeeperTest is Test {
         w = new uint256[](2);
         w[0] = w0;
         w[1] = w1;
+    }
+
+    function test_review_strategy_removal_requires_disposal_but_retained_assets_can_change() public {
+        aapl.mint(address(vault), 100e18);
+        uint256 nav = vault.totalAssets();
+        MockERC20 added = new MockERC20("Added", "ADD", 18);
+        feed.setPrice(address(added), 1e18);
+        address[] memory legs = new address[](2);
+        legs[0] = address(msft);
+        legs[1] = address(added);
+        uint256[] memory weights = new uint256[](2);
+        weights[0] = 5000;
+        weights[1] = 5000;
+        vm.expectRevert(abi.encodeWithSelector(IVaultKeeper.StrategyAssetNotEmpty.selector, address(aapl)));
+        vault.setStrategy(legs, weights);
+        assertEq(vault.totalAssets(), nav);
+        weights[0] = 6000;
+        weights[1] = 4000;
+        vault.updateWeights(weights);
+        assertEq(vault.totalAssets(), nav, "retained inventory never leaves NAV");
+    }
+
+    function test_review_deposit_token_cannot_be_a_strategy_leg() public {
+        feed.setPrice(address(usdc), 1e18);
+        address[] memory legs = new address[](2);
+        legs[0] = address(usdc);
+        legs[1] = address(aapl);
+        uint256[] memory weights = new uint256[](2);
+        weights[0] = 5000;
+        weights[1] = 5000;
+        vm.expectRevert(abi.encodeWithSelector(VaultKeeper.InvalidStrategy.selector, "DEPOSIT_ASSET"));
+        vault.setStrategy(legs, weights);
+        usdc.mint(address(vault), 1000e6);
+        assertEq(vault.grossAssets(), usdc.balanceOf(address(vault)));
+    }
+
+    function testFuzz_review_all_preview_bounds_after_elapsed_fees(uint64 amount) public {
+        uint256 assets = bound(uint256(amount), 1e6, 100_000e6);
+        vault.setManagementFee(1000);
+        vault.setPerformanceFee(2000);
+        vm.prank(user);
+        vault.deposit(1_000_000e6, user);
+        vm.warp(block.timestamp + 30 days);
+        uint256 quoteShares = vault.previewWithdraw(assets);
+        uint256 balance = vault.balanceOf(user);
+        vm.prank(user);
+        assertLe(vault.withdraw(assets, user, user), quoteShares);
+        balance = vault.balanceOf(user);
+        uint256 shares = bound(uint256(amount), 1, balance);
+        uint256 quoteAssets = vault.previewRedeem(shares);
+        vm.prank(user);
+        assertGe(vault.redeem(shares, user, user), quoteAssets);
+        quoteShares = vault.previewDeposit(assets);
+        vm.prank(user);
+        assertGe(vault.deposit(assets, user), quoteShares);
+        quoteAssets = vault.previewMint(shares);
+        vm.prank(user);
+        assertLe(vault.mint(shares, user), quoteAssets);
+    }
+
+    function testFuzz_review_coarse_decimal_valuation_and_inverse(uint32 rawAmount) public {
+        uint256 amount = bound(uint256(rawAmount), 1, 10000);
+        MockERC20 coarse = new MockERC20("Whole units", "WHOLE", 0);
+        feed.setPrice(address(coarse), 1.5e18);
+        address[] memory legs = new address[](2);
+        legs[0] = address(coarse);
+        legs[1] = address(msft);
+        uint256[] memory weights = new uint256[](2);
+        weights[0] = 5000;
+        weights[1] = 5000;
+        vault.setStrategy(legs, weights);
+        usdc.mint(user, 10_000e6);
+        vm.startPrank(user);
+        usdc.approve(address(vault), 10_000e6);
+        vault.deposit(10_000e6, user);
+        vm.stopPrank();
+        uint256 beforeAssets = vault.grossAssets();
+        coarse.mint(address(vault), amount);
+        assertEq(vault.grossAssets() - beforeAssets, amount * 1_500_000, "no intermediate truncation");
+        router.setPair(address(usdc), address(coarse), 1e18, 1.5e18);
+        coarse.mint(address(router), amount);
+        usdc.mint(address(router), amount * 1_500_000);
+        uint256 exitShares = vault.balanceOf(user);
+        vm.prank(user);
+        vault.redeem(exitShares, user, user);
+        assertEq(coarse.balanceOf(address(vault)), 0, "inverse conversion can liquidate the coarse position");
+    }
+
+    function test_review_emergency_cannot_take_fee_cash() public {
+        usdc.mint(address(vault), 100e6);
+        vault.setManagementFee(1000);
+        vm.warp(block.timestamp + 365 days);
+        vault.setManagementFee(1000);
+        uint256 fees = vault.accruedFees();
+        vm.expectRevert();
+        vault.emergencyWithdraw(address(usdc), 100e6 - fees + 1, other);
+    }
+
+    function test_review_constructor_rejects_deposit_asset_leg() public {
+        feed.setPrice(address(usdc), 1e18);
+        address[] memory legs = new address[](1);
+        legs[0] = address(usdc);
+        uint256[] memory weights = new uint256[](1);
+        weights[0] = 10000;
+        vm.expectRevert(abi.encodeWithSelector(VaultKeeper.InvalidStrategy.selector, "DEPOSIT_ASSET"));
+        new VaultKeeper(
+            "Bad",
+            "BAD",
+            address(usdc),
+            address(feed),
+            address(router),
+            IVaultKeeper.Strategy(legs, weights),
+            address(this)
+        );
+    }
+
+    function test_review_sync_exit_cannot_spend_reserved_fee_cash() public {
+        vm.prank(user);
+        vault.deposit(1_000e6, user);
+        vault.setManagementFee(1000);
+        vm.warp(block.timestamp + 365 days);
+        vault.setManagementFee(1000);
+        uint256 fees = vault.accruedFees();
+        vm.prank(user);
+        vault.withdraw(1_000e6 - fees, user, user);
+        assertGe(usdc.balanceOf(address(vault)), fees);
+        assertEq(vault.accruedFees(), fees);
     }
 }

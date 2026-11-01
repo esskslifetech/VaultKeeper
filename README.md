@@ -5,11 +5,9 @@ Chainlink-Automation-compatible keeper.**
 
 Solidity 0.8.28 · Foundry · MIT
 
-> **Status: research / testnet software — not audited, not deployed.** Every claim below was
-> verified against the code in this repository. `forge test` runs **116 tests** with no network;
-> with an RPC, **131 tests** pass against live Ethereum mainnet state, including six that make
-> the vault **actually trade tokenised equities** through real Uniswap V3 pools — see
-> [§11](#11-tokenised-equities-what-is-verified-and-what-the-vault-actually-trades).
+> **Status: research / testnet software — not audited, not deployed.** The local remediation
+> suite currently runs **157 tests passed, 15 fork tests skipped** without an RPC. The optional
+> mainnet suites were not rerun in this environment and require fresh verification before use.
 > The contracts are **not** independently audited, the frontend is **not** part of this
 > repository, and the deployment script wires up **mock** tokens, a mock oracle and a mock swap
 > venue. There is no production deployment of this code, and it must not hold real money.
@@ -22,11 +20,10 @@ Solidity 0.8.28 · Foundry · MIT
 |---|---|
 | `contracts/` | The whole project: Solidity sources, tests, deployment script. Dependencies are vendored in `contracts/lib` (no `forge install`, no network access needed to build). |
 | `contracts/src/` | `VaultKeeper.sol`, `AsyncVaultKeeper.sol`, `PriceFeed.sol`, `Automation.sol`, `XStocksMarket.sol`, `XStockIntegration.sol` + mocks and interfaces. |
-| `contracts/test/` | 5 Foundry suites (116 tests, one per audited failure mode) plus 2 optional live-mainnet fork suites (15 tests) that trade and verify against real chain state. |
+| `contracts/test/` | 6 local Foundry suites (157 passing tests) plus 2 optional live-mainnet fork suites (15 tests) that trade and verify against real chain state. |
 | `contracts/script/Deploy.s.sol` | The only deployment script. Deploys mocks + vault + keeper, wires the keeper, writes `deployments/<chainId>.json`. |
-| `docs/` | [xStocks integration notes](docs/XSTOCKS_INTEGRATION.md) — including what was verified against mainnet and what is explicitly *not* wired — and the pre-rewrite audit report retained for provenance. |
+| `docs/` | [Accounting and integration invariants](docs/ACCOUNTING_AND_INTEGRATION.md), [xStocks integration notes](docs/XSTOCKS_INTEGRATION.md) — including what was verified against mainnet and what is explicitly *not* wired — and the pre-rewrite audit report retained for provenance. |
 | `vaultkeeper` | Optional bash helper: local Anvil + deploy (`./vaultkeeper dev --deploy`). |
-| `full-summary.md` | The whole project in one pass: origin, audit findings, architecture, verification, operations, limits. Start here if you want the complete picture. |
 | `CONTRIBUTING.md` | The four gates a pull request must pass, and the rules that are not negotiable. |
 | `.github/workflows/ci.yml` | CI: fmt → build → test → lint → deploy dry run, plus an opt-in live-mainnet fork job. |
 | `subgraph/` | **A GraphQL schema only** — no manifest, no mappings, no deployment. Not buildable. |
@@ -55,10 +52,10 @@ Solidity 0.8.28 · Foundry · MIT
 
 | Contract | Lines | Responsibility |
 |---|---|---|
-| `src/VaultKeeper.sol` | 1,023 | ERC-4626 vault (OpenZeppelin v5.6.1). Weighted strategy, decimal-safe NAV, slippage-bounded swaps **with a per-leg Uniswap V3 fee tier**, excess-only rebalancing, on-book fee accrual, permissionless fee sweep, configurable share-transfer policy. |
-| `src/AsyncVaultKeeper.sol` | 622 | ERC-7540 async request/claim layer over `VaultKeeper`: `requestDeposit`/`requestRedeem` → fulfill → claim, with operators and an accounting invariant that keeps every request/claim transition share-price neutral. |
-| `src/PriceFeed.sol` | 713 | Multi-source oracle. True weighted median over up to 5 sources/asset, normalised to a configurable decimal scale, with per-asset staleness limits and circuit breakers. |
-| `src/Automation.sol` | 630 | Chainlink Automation keeper. Time / price-deviation / liquidation / **fee-sweep** triggers, one rebalance per upkeep, resettable failure circuit breaker, error decoding. |
+| `src/VaultKeeper.sol` | — | ERC-4626 vault (OpenZeppelin v5.6.1). Weighted strategy, decimal-safe NAV, slippage-bounded swaps **with a per-leg Uniswap V3 fee tier**, excess-only rebalancing, on-book fee accrual, permissionless fee sweep, configurable share-transfer policy. |
+| `src/AsyncVaultKeeper.sol` | — | ERC-7540 async request/claim layer over `VaultKeeper`: `requestDeposit`/`requestRedeem` → fulfill → claim, with operators and an accounting invariant that keeps every request/claim transition share-price neutral. |
+| `src/PriceFeed.sol` | — | Multi-source oracle. True weighted median over up to 5 sources/asset, normalised to a configurable decimal scale, with per-asset staleness limits and circuit breakers. |
+| `src/Automation.sol` | — | Chainlink Automation keeper. Time / price-deviation / liquidation / **fee-sweep** triggers, one rebalance per upkeep, resettable failure circuit breaker, error decoding. |
 | `src/XStocksMarket.sol` | 317 | Real-market adapter for tokenised equities: validates the token contract, discovers a Uniswap V3 pool across four fee tiers, prices it with `sqrtPriceX96` math, and refuses to trade when the pool and the oracle diverge. Addresses are constructor arguments — none are hardcoded. |
 | `src/XStockIntegration.sol` | 665 | Stand-alone xStocks collateral adapter (health factors, liquidation math). Not wired into the vault or the deployment script. |
 | `src/MockSwapRouter.sol` | 97 | Decimals-agnostic Uniswap-V3-shaped router used by tests and the local deployment. Records the fee tier of each swap so per-leg routing is assertable. |
@@ -66,9 +63,10 @@ Solidity 0.8.28 · Foundry · MIT
 | `src/interfaces/` | 1,163 | `IVaultKeeper`/`IStockPriceFeed` (`TransferMode`, sweep and per-leg fee-tier surface), `IXStocks`, `IXStockVault`, `IUniswapV3SwapRouter` (its swap struct matches the real mainnet router ABI). |
 
 All production contracts deploy unchanged, with margin against the 24,576-byte EIP-170 limit.
-Measured with `forge build --sizes`: `VaultKeeper` 18,746 B · `AsyncVaultKeeper` 22,999 B
-(closest to the limit, as it inherits the vault) · `Automation` 13,057 B · `PriceFeed` 11,965 B ·
-`XStockIntegration` 10,925 B · `XStocksMarket` 6,166 B.
+Measured with Foundry 1.7.1 / solc 0.8.28 and the repository optimizer settings:
+`VaultKeeper` 19,665 B · `AsyncVaultKeeper` 24,256 B (320 B runtime margin) ·
+`Automation` 14,450 B · `PriceFeed` 12,453 B · `XStockIntegration` 10,925 B ·
+`XStocksMarket` 6,166 B. Recheck sizes after every change; the async contract is close to the limit.
 
 ---
 
@@ -80,7 +78,7 @@ Prerequisites: [Foundry](https://book.getfoundry.sh/getting-started/installation
 ```bash
 cd contracts
 forge build
-forge test                 # 116 tests, 5 suites (fork suites auto-skip)
+forge test                 # local suites; fork tests require an RPC
 forge fmt --check src test script
 forge lint src test        # clean: 0 findings
 ```
@@ -180,7 +178,9 @@ here — no mainnet addresses or forking tests are provided or claimed.
   target and buys/sells only the amount outside a ±`REBALANCE_TOLERANCE_BPS` (500 bps = 5%)
   band. A leg that is already on target is left alone, and rebalancing when everything is
   inside the band is a no-op rather than a full liquidation-and-repurchase.
-* Cash reserved for `accruedFees` is never spent on trades.
+* Cash reserved for `accruedFees` and async request/claim buckets is never spent on trades.
+* The deposit asset is counted once as cash and cannot also be a strategy leg. Replacing a
+  strategy cannot remove a held token from NAV; dispose of it first or retain the leg.
 * NAV is re-read after every leg, so the weights used for leg *n+1* reflect the trades made for
   leg *n*.
 
@@ -208,9 +208,11 @@ here — no mainnet addresses or forking tests are provided or claimed.
 
 * Management fee (annual, cap 10%) plus performance fee (cap 20%) on gains above a
   high-water mark seeded at the vault's first funding.
-* Fees are **accrued on-book** into `accruedFees` and immediately reduce `totalAssets()`, so
-  NAV never over-reports to depositors. Assessment runs on every deposit, withdraw, redeem and
-  rebalance; if no time has elapsed and no new profit was made, nothing accrues.
+* Fees are **accrued on-book** into `accruedFees` and reduce stored `totalAssets()`.
+  Conversions and previews additionally subtract the same prospective elapsed fee that
+  execution will assess, without mutating state. Assessment runs before pricing on deposits,
+  exits, async redemption requests and rebalances. The fee clock advances only after the
+  elapsed-fee calculation, so a full exit cannot erase earned fees.
 * Two ways to move the accrued amount out, and they behave identically once they fire:
   `collectFees()` is **owner-only and interval-agnostic**; `sweepFees()` is
   **permissionless** and gated on `feesSweepDue()` (`accruedFees != 0` *and* the sweep interval
@@ -237,7 +239,7 @@ here — no mainnet addresses or forking tests are provided or claimed.
 * Implements **ERC-7540** on top of the vault: `requestDeposit(assets, controller, owner)` and
   `requestRedeem(shares, controller, owner)` open a request; `fulfillDeposits(controllers[])`
   and `fulfillRedeems(controllers[])` (owner **or** the vault's keeper) settle them, and
-  `selfFulfill()` lets any account settle **its own** request without permission; the standard
+  `selfFulfill()` lets any account advance **its own** request without permission; the standard
   synchronous `deposit`/`mint`/`withdraw`/`redeem` **become the claim functions**, bounded by
   `InsufficientClaimable`, exactly as the standard specifies.
 * Operators are first-class (`setOperator`/`isOperator`, `OperatorSet`), `requestRedeem` also
@@ -247,11 +249,15 @@ here — no mainnet addresses or forking tests are provided or claimed.
   (operator) and ERC-7575's `0x2f0a18c5`; `share()` returns the vault itself.
 * Every `preview*` function **reverts** (`PreviewNotSupported`), which is what ERC-7540 requires
   for an async vault — a preview implies a synchronous price that does not exist here.
-* Accounting invariant: `totalAssets()` subtracts all four held buckets (pending and claimable
-  deposits, pending and claimable redemption assets) and rebalancing may never spend them
-  (`_reservedCash()`), so moving between request and claim cannot move the share price.
-  **Redemptions are priced when the request is placed; deposits when they are claimed** —
-  the one asymmetry worth reading twice.
+* Accounting invariant: `totalAssets()` subtracts all four held buckets and `_reservedCash()`
+  protects them from trading, fees and emergency cash removal. **A redemption request first
+  assesses fees, then liquidates its marked entitlement into cash.** Only realizable proceeds
+  (after venue costs) become the fixed, reserved liability; shares burn only after successful
+  settlement. Failed/illiquid settlement reverts atomically. Fulfillment and `selfFulfill()`
+  only advance lifecycle state; claims transfer already-reserved cash. A later market loss
+  cannot reduce that backing. Deposits are still priced when claimed.
+* `maxDeposit`/`maxMint` report claimable deposit capacity, not unlimited request admission;
+  `maxWithdraw`/`maxRedeem` report settled redemption claims. All return zero while paused.
 
 ### Safety rails
 
@@ -260,8 +266,8 @@ here — no mainnet addresses or forking tests are provided or claimed.
   `maxRedeem` all return 0 while paused (pinned by `test_pause_blocks_core_flows`). The owner
   or keeper retains `emergencyWithdraw` to move assets out of a paused vault. Read this as an
   emergency brake, not as an exit-preserving pause.
-* A stale price is a hard error: `_priceOf` reverts `StalePrice(asset, updatedAt, threshold)`
-  rather than silently valuing a leg at zero.
+* A stale price is a hard error: `_priceOf` checks `priceValidity(asset)` and rejects an
+  observation outside its original validity window rather than trusting cache-write time.
 * Access control: `Ownable2Step` owner, a `keeper` (the only non-owner role that can
   `rebalance()`), a separate `pauser`, and owner-only admin. `emergencyWithdraw` is callable by
   the owner **or** the keeper, because `Automation` routes its governor-gated emergency path
@@ -281,7 +287,12 @@ here — no mainnet addresses or forking tests are provided or claimed.
   time (`UnsupportedSourceType`) instead of being accepted and then never producing a price.
 * Prices are stored on one configurable decimal scale (≤ 36 dp).
 * **Staleness**: `globalStaleness` (default 3,600 s, bounded 60 s – 24 h) or a per-asset
-  override, plus a 300 s heartbeat grace. Reads revert when stale.
+  override. Provider timestamps must be nonzero, nonfuture and within that age policy.
+  Aggregation preserves the oldest accepted observation and its expiry; refreshing a cache
+  cannot restart its lifetime. `lastUpdate` remains ingestion metadata; `priceValidity`
+  returns the observation/expiry used by consumers. Shortening policy tightens existing data;
+  lengthening it cannot revive an expired observation. Manual overrides are source-count-zero
+  observations with their own authorized timestamp and expiry. Reads also reject a paused feed.
 * **Circuit breaker** (per asset): a move larger than `deviationBps` (default `5,000` = 50%)
   persists a trip, refuses to adopt the new price, and blocks reads for that asset until
   governance calls `resetCircuitBreaker(asset)` or `overridePrice(asset, price, reason)`. Other
@@ -303,7 +314,11 @@ here — no mainnet addresses or forking tests are provided or claimed.
   **at most one `rebalance()` executes per upkeep**. The sweep bit wraps `sweepFees()` in
   `try/catch`, so a sweep that reverts is recorded against `"FEE_SWEEP"` in `lastError`
   (`FeeSweepExecuted` is emitted on success) instead of reverting the whole upkeep.
-* After `maxConsecutiveFailures` (default 3) failed upkeeps the breaker trips: `checkUpkeep`
+* `performData` is version 2: `(uint8 version, uint256 triggers, uint256 context, bytes32 stockHash)`.
+  Execution recomputes due work and rejects empty, unknown, not-due or stale selections before
+  changing failure counters. Liquidation context is a subset of currently eligible indices;
+  the stock-list identity hash prevents a reorder from changing what an index means.
+* After `maxConsecutiveFailures` (default 3) genuinely failed jobs the breaker trips: `checkUpkeep`
   stops asking for work, `performUpkeep` reverts, and `resetCircuitBreaker()` (governor)
   clears it. A successful upkeep clears the counter.
 * Revert reasons are decoded: `Error(string)` reverts are stored as readable text in
@@ -312,7 +327,9 @@ here — no mainnet addresses or forking tests are provided or claimed.
 * `emergencyWithdraw` (governor-only wrapper) forwards to the vault's emergency path.
 * **Liquidation is off by default and cannot run until it is configured**: it needs an
   `xStocks` address, `setCollateralConfig(asset, feed)`, and `setLiquidationEnabled(true)`; the
-  local deployment leaves it disabled.
+  local deployment leaves it disabled. Execution rechecks enablement, eligibility and both
+  quote freshness windows, and never passes a zero minimum output. It scans the 16-index
+  selection domain but executes at most five eligible jobs, so later selected indices are reachable.
 
 ---
 
@@ -320,7 +337,7 @@ here — no mainnet addresses or forking tests are provided or claimed.
 
 ```bash
 cd contracts
-forge test                                    # 116 tests (fork suites auto-skip)
+forge test                                    # local suites; fork tests require an RPC
 forge test --match-path test/VaultKeeper.t.sol
 forge test --match-path test/PriceFeed.t.sol
 forge test --match-path test/Automation.t.sol
@@ -330,10 +347,10 @@ forge test --match-path test/VaultGovernance.t.sol    # fee sweep + share transf
 
 | Suite | Tests | Covers |
 |---|---|---|
-| `test/VaultKeeper.t.sol` | 32 | ERC-4626 surface, decimals, donation attack, slippage, excess-only rebalancing, fee accounting, strategy/access/pause rules, staleness, emergency withdrawal, per-leg fee-tier overrides, and redemption sizing against a venue that pays below the oracle mark. |
-| `test/PriceFeed.t.sol` | 26 | Median correctness and order-independence, batch updates, breaker lifecycle, two-step governance, source types, Pyth exponent normalisation, staleness, source health, history. |
-| `test/Automation.t.sol` | 14 | Keeper authorisation, single-rebalance-per-upkeep, trigger bits, breaker trip/reset, decoded error reasons, whitelist, pause, snapshot, emergency withdrawal. |
-| `test/AsyncVaultKeeper.t.sol` | 27 | ERC-7540 conformance (interface IDs, `preview*` reverting, request-id semantics, `share()`), request/claim lifecycle, operator and allowance matrix, NAV-exclusion accounting, per-request redemption pricing, reserved-cash rebalancing, pause. |
+| `test/VaultKeeper.t.sol` | 39 | ERC-4626 surface, decimals, donation attack, slippage, excess-only rebalancing, fee accounting, strategy/access/pause rules, staleness, emergency withdrawal, per-leg fee-tier overrides, and redemption sizing against a venue that pays below the oracle mark. |
+| `test/PriceFeed.t.sol` | 31 | Median correctness and order-independence, batch updates, breaker lifecycle, two-step governance, source types, Pyth exponent normalisation, staleness, source health, history. |
+| `test/Automation.t.sol` | 14 (+5 review regressions in `AutomationReview.t.sol`) | Keeper authorisation, single-rebalance-per-upkeep, trigger bits, breaker trip/reset, decoded error reasons, whitelist, pause, snapshot, emergency withdrawal. |
+| `test/AsyncVaultKeeper.t.sol` | 37 | ERC-7540 conformance (interface IDs, `preview*` reverting, request-id semantics, `share()`), request/claim lifecycle, operator and allowance matrix, NAV-exclusion accounting, per-request redemption pricing, reserved-cash rebalancing, pause. |
 | `test/VaultGovernance.t.sol` | 17 | Fee accrual and permissionless `sweepFees`, interval and recipient rules, sweep-must-not-move-share-price, keeper-triggered sweep, `TransferMode` policy (unrestricted / allowlist / locked), lock expiry, mint/burn always allowed. |
 | `test/XStocksFork.t.sol` | 9 | **Live Ethereum mainnet** (skipped unless `MAINNET_RPC_URL` is set): the real AAPLx token, the absence of an AAPLx market, real Uniswap V3 price math cross-checked against the real Chainlink ETH/USD and USDC/USD proxies, reciprocal pricing, and the divergence guard. |
 | `test/TokenisedEquityTrading.t.sol` | 6 | **Live Ethereum mainnet, real trades** (same skip rule): the vault deposits USDC, buys **TSLAon** and **SPYon** through the real Uniswap V3 pools at their real fee tiers, asserts the tokens land in the vault and the cash lands in the pools, marks NAV against the real Chainlink feeds, refuses to churn an on-target book, sells the equities back on redemption, proves the slippage guard blocks a sabotaged oracle against a live pool, and pins the one thing that *cannot* always work — a full-NAV redemption while the venue pays below the oracle mark. |
@@ -341,15 +358,15 @@ forge test --match-path test/VaultGovernance.t.sol    # fee sweep + share transf
 Tests are named after the audit findings they pin down (e.g.
 `test_H5_weighted_median_is_the_true_median`). The only test doubles are the in-repo mocks plus
 two small stubs declared inside `PriceFeed.t.sol` (a Chainlink aggregator and a Pyth oracle).
-Current result: **116 passed, 0 failed, 15 skipped** without an RPC, and **131 passed, 0 failed**
-with one — the 15 fork tests only skip because they need real chain state. `forge fmt --check
-src test script` is clean; `forge lint src` and `forge lint test` report zero findings.
+Current local result: **157 passed, 0 failed, 15 skipped** with `forge test`.
+The explicit non-fork run (`--no-match-path 'test/*Fork*'`) passes 157 and skips six. Formatting and lint pass. The deployment script
+also passes an in-memory dry run. Live-fork results are historical, not a claim about this run.
 
 The fork suites are opt-in because they need an RPC and live market data:
 
 ```bash
 cd contracts
-MAINNET_RPC_URL=https://ethereum-rpc.publicnode.com forge test -vv          # all 131
+MAINNET_RPC_URL=https://ethereum-rpc.publicnode.com forge test -vv          # opt-in live suites
 MAINNET_RPC_URL=... forge test --match-path test/TokenisedEquityTrading.t.sol -vv
 
 # Reproducible run against a pinned block instead of latest:

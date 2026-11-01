@@ -105,7 +105,7 @@ contract AutomationTest is Test {
         (bool needed, bytes memory performData) = automation.checkUpkeep("");
         assertTrue(needed);
 
-        (, uint256 bitmask,) = abi.decode(performData, (uint8, uint256, uint256));
+        (, uint256 bitmask,,) = abi.decode(performData, (uint8, uint256, uint256, bytes32));
         console2.log("trigger bitmask:", bitmask);
         assertTrue(bitmask & automation.TRIGGER_TIME_REBALANCE() != 0, "time bit");
         assertTrue(bitmask & automation.TRIGGER_PRICE_DEVIATION() != 0, "deviation bit");
@@ -129,9 +129,8 @@ contract AutomationTest is Test {
         vm.warp(block.timestamp + INTERVAL + 1);
         (, bytes memory performData) = automation.checkUpkeep("");
 
-        // Make the underlying rebalance fail.
-        vault.setKeeper(address(0xDEAD));
-
+        // Real execution failures (not unauthorized submissions) advance the breaker.
+        router.setRate(address(usdc), address(aapl), 1);
         for (uint256 i; i < 3; ++i) {
             automation.performUpkeep(performData);
         }
@@ -152,7 +151,7 @@ contract AutomationTest is Test {
         assertEq(automation.consecutiveFailures(), 0);
         assertFalse(automation.circuitBreakerTripped());
 
-        vault.setKeeper(address(automation));
+        router.setPair(address(usdc), address(aapl), 1e18, 200e18);
         automation.performUpkeep(performData);
         assertEq(automation.totalRebalances(), 1, "recovered");
     }
@@ -203,7 +202,7 @@ contract AutomationTest is Test {
         (bool needed,) = automation.checkUpkeep("");
         assertFalse(needed, "paused");
 
-        bytes memory performData = abi.encode(automation.DATA_VERSION(), uint256(1), uint256(0));
+        bytes memory performData = abi.encode(automation.DATA_VERSION(), uint256(1), uint256(0), bytes32(0));
         vm.expectRevert(AutomationPaused.selector);
         automation.performUpkeep(performData);
 
@@ -214,7 +213,7 @@ contract AutomationTest is Test {
 
     function test_unsupported_data_version_reverts() public {
         vault.setKeeper(address(automation));
-        bytes memory bad = abi.encode(uint8(99), uint256(1), uint256(0));
+        bytes memory bad = abi.encode(uint8(99), uint256(1), uint256(0), bytes32(0));
         vm.expectRevert(abi.encodeWithSelector(UnsupportedDataVersion.selector, 99));
         automation.performUpkeep(bad);
     }
@@ -223,8 +222,9 @@ contract AutomationTest is Test {
         vault.setKeeper(address(automation));
         automation.setUseKeeperWhitelist(true);
         automation.setKeeperWhitelist(address(0xBEEF), true);
+        vm.warp(block.timestamp + INTERVAL + 1);
 
-        bytes memory performData = abi.encode(automation.DATA_VERSION(), uint256(1), uint256(0));
+        bytes memory performData = abi.encode(automation.DATA_VERSION(), uint256(1), uint256(0), bytes32(0));
 
         vm.expectRevert(abi.encodeWithSelector(KeeperNotAllowed.selector, address(this)));
         automation.performUpkeep(performData);
@@ -259,7 +259,7 @@ contract AutomationTest is Test {
 
         (bool needed, bytes memory performData) = automation.checkUpkeep("");
         if (needed) {
-            (, uint256 bitmask,) = abi.decode(performData, (uint8, uint256, uint256));
+            (, uint256 bitmask,,) = abi.decode(performData, (uint8, uint256, uint256, bytes32));
             assertEq(bitmask & automation.TRIGGER_LIQUIDATION(), 0, "no liquidation without a protocol");
         }
 
@@ -290,7 +290,7 @@ contract AutomationTest is Test {
         try automation.emergencyWithdraw(address(usdc), 5e6) {
             fail("expected the vault to reject the call");
         } catch (bytes memory data) {
-            assertEq(bytes4(data), EmergencyWithdrawFailed.selector, "typed error");
+            assertEq(Bytes.slice(data, 0, 4), abi.encodePacked(EmergencyWithdrawFailed.selector), "typed error");
             string memory reason = abi.decode(Bytes.slice(data, 4), (string));
             console2.log("surfaced reason:", reason);
             assertGt(bytes(reason).length, 0, "reason captured");

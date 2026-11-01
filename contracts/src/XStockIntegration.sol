@@ -210,7 +210,6 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
         // Burn xStock tokens. The position has already been debited above and this
         // entrypoint is nonReentrant, so the external call cannot re-enter with a
         // half-updated position.
-        // forge-lint: disable-next-line(reentrancy-no-eth)
         IXStockToken(xStockAsset).burn(msg.sender, xStockAmount);
 
         // Return collateral
@@ -420,7 +419,6 @@ contract XStockIntegration is IXStockVault, ReentrancyGuard, Ownable, Pausable {
 
         // Burn liquidated xStock. Position updated first; `liquidate` is nonReentrant.
         position.mintedXStock -= liquidateAmount;
-        // forge-lint: disable-next-line(reentrancy-no-eth)
         IXStockToken(xStock).burn(user, liquidateAmount);
 
         // Transfer seized collateral to liquidator

@@ -286,7 +286,6 @@ contract XStocksMarket {
             revert UnsupportedPair(base, quote);
         }
 
-        // forge-lint: disable-next-line(unused-return)
         (uint160 sqrtPriceX96,,,,,,) = p.slot0(); // only the price is needed; the rest is tick/observation state
 
         uint256 ratioX18 = _spotPriceX18(sqrtPriceX96, IERC20Symbol(token0).decimals(), IERC20Symbol(token1).decimals());

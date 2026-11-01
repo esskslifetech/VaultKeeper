@@ -4,20 +4,21 @@ Foundry project for the VaultKeeper contracts: an ERC-4626 vault holding a weigh
 tokenised equities, an asynchronous ERC-7540 layer over it, a multi-source oracle, and a
 Chainlink-Automation-compatible keeper.
 
-**Architecture, parameters, deployment and the audit mapping live in the
-[root README](../README.md).** This file covers only what you need while working inside
+**Architecture, parameters and deployment live in the [root README](../README.md).
+Current settlement, oracle and keeper invariants are in
+[ACCOUNTING_AND_INTEGRATION.md](../docs/ACCOUNTING_AND_INTEGRATION.md).** This file covers only what you need while working inside
 `contracts/`.
 
 ```bash
 export PATH="$PATH:$HOME/.foundry/bin"   # if forge is not already on PATH
 
 forge build
-forge test                                        # 116 tests, 5 suites
+forge test                                        # local suites; fork tests require an RPC
 forge fmt --check src test script
 forge lint src test                               # 0 findings
 
 # Live Ethereum mainnet suites (need an RPC, auto-skip without one).
-# With the RPC set: 131 tests pass, including real trades on real Uniswap V3 pools.
+# Opt-in: real trades on real Uniswap V3 pools; rerun after every trading-path change.
 MAINNET_RPC_URL=https://ethereum-rpc.publicnode.com forge test -vv
 MAINNET_RPC_URL=... forge test --match-path test/TokenisedEquityTrading.t.sol -vv
 ```
@@ -53,9 +54,11 @@ lib/                        vendored dependencies - no `forge install`, no netwo
 * Anything the fee sweep or the async layer must respect is routed through a hook, not
   duplicated: `_reservedCash()` (cash the vault may not trade) and `_seedHighWaterMark()` are
   `virtual` on `VaultKeeper` and overridden by `AsyncVaultKeeper`.
-* `AsyncVaultKeeper` prices **redemptions at request time and deposits at claim time**, and its
-  `totalAssets()` subtracts all four held buckets. Changing either without changing the other
-  moves the share price; `test/AsyncVaultKeeper.t.sol` pins both.
+* `AsyncVaultKeeper` settles redemption cash **at request time**, after fee assessment and
+  before burning shares. Only realizable proceeds become a fixed liability. Fulfillment only
+  advances state; claims pay reserved cash. Deposits are priced at claim time. `totalAssets()`
+  subtracts all four held buckets and `_reservedCash()` protects them across every outflow.
+  `test/AsyncVaultKeeper.t.sol` pins loss resistance, full exits, failed settlement and claim order.
 * Tests that move the oracle must move the mock router's pair too
   (`router.setPair(usdc, asset, 1e18, newPrice)`), otherwise the vault's own slippage guard
   correctly reverts the trade.
@@ -65,9 +68,9 @@ lib/                        vendored dependencies - no `forge install`, no netwo
 * Each strategy leg can route through its own Uniswap V3 fee tier
   (`setFeeTierOverride(asset, fee)`); the mock router records the tier it was given
   (`router.lastFee(tokenIn, tokenOut)`) so the routing is assertable without a fork.
-* `forge lint` findings are either fixed or suppressed inline with a reason:
-  `// forge-lint: disable-next-line(<lint-id>)` — the comment must sit **immediately** above the
-  flagged line. `foundry.toml`'s `[lint] exclude_lints` covers only idiom false positives.
+* `forge lint` uses Foundry 1.7.1 lint IDs. `foundry.toml` excludes intentional timestamp
+  comparisons and test-only unchecked-transfer warnings; production token movements use
+  SafeERC20. Any inline suppression needs a valid ID and a reason immediately above the line.
 * `forge lint` and `forge build` print nothing on a cached build; use `forge build --force` when
   you actually want to see diagnostics.
 

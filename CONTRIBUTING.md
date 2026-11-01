@@ -11,7 +11,7 @@ Every pull request must pass all four. They are the same commands CI runs
 ```bash
 cd contracts
 forge build
-forge test                 # 116 tests, 5 suites - fork suites skip without an RPC
+forge test                 # local suites; fork tests require an RPC
 forge fmt --check src test script
 forge lint src test        # must stay at 0 findings
 ```
@@ -20,7 +20,7 @@ If your change touches the trading path, the fee logic, the oracle or the async 
 live suites too — they are the only tests that use real pools and real prices:
 
 ```bash
-MAINNET_RPC_URL=https://ethereum-rpc.publicnode.com forge test -vv    # 131 tests
+MAINNET_RPC_URL=https://ethereum-rpc.publicnode.com forge test -vv    # opt-in live suites
 ```
 
 ## Rules that are not negotiable
@@ -43,7 +43,6 @@ MAINNET_RPC_URL=https://ethereum-rpc.publicnode.com forge test -vv    # 131 test
 
 | Document | Why |
 |---|---|
-| [`full-summary.md`](full-summary.md) | The complete story in one document — start here if you are new to the project. |
 | [`README.md`](README.md) | Behaviour, parameters, test map, and the honest limits (§10, §11). |
 | [`contracts/README.md`](contracts/README.md) | Working conventions that will bite you: interface sync rules, the `_reservedCash`/`_seedHighWaterMark` hooks, `vm.prank` traps, per-leg fee tiers. |
 | [`docs/AUDIT_2026-09.md`](docs/AUDIT_2026-09.md) | The report that motivated the rewrite, kept verbatim. |

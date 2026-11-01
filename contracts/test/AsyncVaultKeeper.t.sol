@@ -153,8 +153,9 @@ contract AsyncVaultKeeperTest is Test {
 
         assertEq(vault.balanceOf(alice), sharesBefore - shares, "shares burned on request");
         assertEq(vault.pendingRedeemRequest(0, alice), shares, "pending shares recorded");
-        assertEq(vault.totalPendingRedeemAssets(), expected, "payout snapshotted");
-        assertApproxEqAbs(vault.totalAssets(), navBefore - expected, 1, "snapshot removed from NAV");
+        assertApproxEqAbs(vault.totalPendingRedeemAssets(), expected, 1, "realizable payout settled");
+        assertGe(usdc.balanceOf(address(vault)), vault.totalPendingRedeemAssets(), "cash backing exists now");
+        assertApproxEqAbs(vault.totalAssets(), navBefore - expected, 1, "marked entitlement removed from NAV");
         assertApproxEqAbs(_pps(), ppsBefore, 1, "share price untouched");
     }
 
@@ -173,13 +174,13 @@ contract AsyncVaultKeeperTest is Test {
         router.setPair(address(usdc), address(msft), 1e18, (P_MSFT * 110) / 100);
 
         uint256 claimed = vault.claimableRedeemAssets(alice);
-        assertEq(claimed, snapshot, "payout fixed at request time");
+        assertApproxEqAbs(claimed, snapshot, 1, "realizable payout fixed at request time");
 
         uint256 before = usdc.balanceOf(alice);
         vm.prank(alice);
         vault.redeem(shares, alice, alice);
 
-        assertEq(usdc.balanceOf(alice) - before, snapshot, "paid the snapshot, not the improved price");
+        assertEq(usdc.balanceOf(alice) - before, claimed, "paid settled cash, not the improved price");
         assertEq(vault.claimableRedeemRequest(0, alice), 0, "position cleared");
     }
 
@@ -402,7 +403,16 @@ contract AsyncVaultKeeperTest is Test {
 
         assertEq(vault.maxWithdraw(alice), snapshot, "maxWithdraw reports the processed payout");
         assertEq(vault.maxRedeem(alice), shares, "maxRedeem reports processed shares");
-        assertEq(vault.maxDeposit(bob), type(uint256).max, "deposits are always requestable");
+        assertEq(vault.maxDeposit(bob), 0, "no claimable deposit means no claim capacity");
+        _requestDeposit(bob, 100_000e6);
+        assertEq(vault.maxDeposit(bob), 0, "pending requests are not claimable");
+        _fulfill(bob);
+        assertEq(vault.maxDeposit(bob), 100_000e6);
+        uint256 mintable = vault.maxMint(bob);
+        assertGt(mintable, 0);
+        vm.prank(bob);
+        vault.mint(mintable, bob);
+        assertEq(vault.maxMint(bob), 0, "exhausted claim has no mint capacity");
     }
 
     function test_pause_blocks_requests_and_claims() public {
@@ -436,14 +446,15 @@ contract AsyncVaultKeeperTest is Test {
         assertEq(vault.claimableDepositRequest(0, bob), 0);
     }
 
-    function test_redeem_claim_liquidates_when_cash_is_short() public {
+    function test_redeem_request_settles_cash_before_claim() public {
         uint256 shares = vault.balanceOf(alice) / 2;
         _requestRedeem(alice, shares);
+        uint256 pending = vault.totalPendingRedeemAssets();
+        assertGe(usdc.balanceOf(address(vault)), pending, "request liquidates backing");
         _fulfillRedeem(alice);
 
         uint256 owed = vault.claimableRedeemAssets(alice);
-        uint256 idle = usdc.balanceOf(address(vault));
-        assertLt(idle, owed, "cash short: the payout must come from the strategy");
+        assertEq(owed, pending, "fulfillment does not reprice settled cash");
 
         uint256 before = usdc.balanceOf(alice);
         vm.prank(alice);
@@ -507,5 +518,191 @@ contract AsyncVaultKeeperTest is Test {
 
         assertGt(vault.accruedFees(), 0, "fees accrued");
         assertLt(vault.totalAssets(), navBefore + 100_000e6, "NAV is net of accrued fees");
+        assertGt(vault.accruedFees(), 0);
+    }
+
+    function _assertSettledBacking() internal view {
+        uint256 liabilities = vault.totalPendingRedeemAssets() + vault.totalClaimableRedeemAssets();
+        assertGe(usdc.balanceOf(address(vault)), liabilities, "fixed claims are cash-backed");
+        assertGe(vault.grossAssets(), liabilities);
+    }
+
+    function test_review_all_supply_settlement_survives_market_loss_and_protects_new_cash() public {
+        uint256 shares = vault.balanceOf(alice);
+        _requestRedeem(alice, shares);
+        _assertSettledBacking();
+        uint256 owed = vault.totalPendingRedeemAssets();
+        feed.setPrice(address(aapl), P_AAPL * 3 / 4);
+        feed.setPrice(address(msft), P_MSFT * 3 / 4);
+        _assertSettledBacking();
+        _requestDeposit(bob, 100_000e6);
+        _fulfill(bob);
+        vm.prank(keeper);
+        vault.rebalance();
+        _assertSettledBacking();
+        assertGe(usdc.balanceOf(address(vault)), owed + 100_000e6);
+        _fulfillRedeem(alice);
+        vm.prank(alice);
+        vault.redeem(shares, alice, alice);
+        vm.prank(bob);
+        vault.deposit(100_000e6, bob);
+        assertGt(vault.balanceOf(bob), 0, "new deposit does not pay an old deficit");
+    }
+
+    function test_review_settled_cash_is_protected_from_fees_recovery_and_trading() public {
+        vault.setManagementFee(1000);
+        vm.warp(block.timestamp + 30 days);
+        feed.setPrice(address(aapl), P_AAPL);
+        feed.setPrice(address(msft), P_MSFT);
+        _requestRedeem(alice, vault.balanceOf(alice) / 2);
+        _requestDeposit(bob, 100_000e6);
+        _fulfill(bob);
+        uint256 cash = usdc.balanceOf(address(vault));
+
+        uint256 claims = vault.totalPendingRedeemAssets() + vault.totalClaimableDeposits();
+        vm.expectRevert();
+        vault.emergencyWithdraw(address(usdc), cash - claims + 1, stranger);
+        vm.prank(keeper);
+        vault.rebalance();
+        _assertSettledBacking();
+        vault.collectFees();
+        _assertSettledBacking();
+        assertGe(usdc.balanceOf(address(vault)), vault.totalClaimableDeposits());
+        vm.prank(bob);
+        vault.deposit(100_000e6, bob);
+        _fulfillRedeem(alice);
+        uint256 owed = vault.claimableRedeemAssets(alice);
+        uint256 before = usdc.balanceOf(stranger);
+        vm.prank(alice);
+        vault.withdraw(owed, stranger, alice);
+        assertEq(usdc.balanceOf(stranger) - before, owed);
+    }
+
+    function test_review_claim_order_does_not_change_total_paid() public {
+        uint256 aliceShares = vault.balanceOf(alice) / 2;
+        _requestDeposit(bob, 500_000e6);
+        _fulfill(bob);
+        vm.prank(bob);
+        vault.deposit(500_000e6, bob);
+        _requestRedeem(alice, aliceShares);
+        uint256 bobShares = vault.balanceOf(bob);
+        _requestRedeem(bob, bobShares);
+        _fulfillRedeem(alice);
+        _fulfillRedeem(bob);
+        uint256 aliceOwed = vault.claimableRedeemAssets(alice);
+        uint256 bobOwed = vault.claimableRedeemAssets(bob);
+        assertApproxEqAbs(aliceOwed, bobOwed, 1, "equal shares differ by at most final-unit rounding, not claim order");
+        assertEq(vault.totalClaimableRedeemAssets(), aliceOwed + bobOwed);
+        uint256 before = usdc.balanceOf(bob);
+        vm.prank(bob);
+        vault.redeem(bobShares, bob, bob);
+        assertEq(usdc.balanceOf(bob) - before, bobOwed);
+        _assertSettledBacking();
+        before = usdc.balanceOf(alice);
+        vm.prank(alice);
+        vault.redeem(aliceShares, alice, alice);
+        assertEq(usdc.balanceOf(alice) - before, aliceOwed);
+        assertEq(vault.totalClaimableRedeemAssets(), 0);
+        assertGt(aliceOwed, 0);
+    }
+
+    function test_review_failed_settlement_does_not_burn_or_create_debt() public {
+        uint256 shares = vault.balanceOf(alice);
+        router.setRate(address(aapl), address(usdc), 1);
+        vm.prank(alice);
+        vm.expectRevert();
+        vault.requestRedeem(shares, alice, alice);
+        assertEq(vault.balanceOf(alice), shares);
+        assertEq(vault.totalPendingRedeemAssets(), 0);
+        assertEq(vault.totalClaimableRedeemAssets(), 0);
+    }
+
+    function test_review_instant_and_self_fulfill_use_settled_cash() public {
+        vault.setFulfillmentMode(AsyncVaultKeeper.FulfillmentMode.INSTANT);
+        uint256 shares = vault.balanceOf(alice) / 4;
+        _requestRedeem(alice, shares);
+        assertEq(vault.claimableRedeemRequest(0, alice), shares);
+        _assertSettledBacking();
+        vault.setFulfillmentMode(AsyncVaultKeeper.FulfillmentMode.MANUAL);
+        _requestRedeem(alice, shares);
+        vm.prank(alice);
+        vault.selfFulfill();
+        _assertSettledBacking();
+        vm.prank(alice);
+        vault.redeem(shares * 2, alice, alice);
+        assertEq(vault.totalClaimableRedeemAssets(), 0);
+    }
+
+    function test_review_exit_costs_borne_by_exiter_not_remaining_holders() public {
+        _requestDeposit(bob, 1_000_000e6);
+        _fulfill(bob);
+        vm.prank(bob);
+        vault.deposit(1_000_000e6, bob);
+        vm.prank(keeper);
+        vault.rebalance();
+        router.setPair(address(usdc), address(aapl), 1e18, P_AAPL * 995 / 1000);
+        router.setPair(address(usdc), address(msft), 1e18, P_MSFT * 995 / 1000);
+        uint256 pps = _pps();
+        uint256 shares = vault.balanceOf(alice) / 2;
+        uint256 marked = vault.convertToAssets(shares);
+        _requestRedeem(alice, shares);
+        assertLt(vault.totalPendingRedeemAssets(), marked, "execution discount reduces exit proceeds");
+        assertApproxEqAbs(_pps(), pps, 2, "remaining holders do not subsidize the discount");
+        _assertSettledBacking();
+    }
+
+    function test_review_full_request_cannot_erase_elapsed_fees() public {
+        vault.setManagementFee(1000);
+        vm.warp(block.timestamp + 30 days);
+        feed.setPrice(address(aapl), P_AAPL);
+        feed.setPrice(address(msft), P_MSFT);
+        _requestRedeem(alice, vault.balanceOf(alice));
+        assertEq(vault.totalSupply(), 0);
+        uint256 fees = vault.accruedFees();
+        assertGt(fees, 0);
+        vault.setManagementFee(1000);
+        assertEq(vault.accruedFees(), fees, "earned fees survive the last share leaving supply");
+        _assertSettledBacking();
+    }
+
+    function test_review_async_limits_are_zero_when_paused() public {
+        _requestDeposit(bob, 100e6);
+        _fulfill(bob);
+        vault.setPaused(true);
+        assertEq(vault.maxDeposit(bob), 0);
+        assertEq(vault.maxMint(bob), 0);
+        assertEq(vault.maxWithdraw(bob), 0);
+        assertEq(vault.maxRedeem(bob), 0);
+    }
+
+    function test_review_performance_fee_settles_before_full_exit() public {
+        vault.setPerformanceFee(2000);
+        feed.setPrice(address(aapl), P_AAPL * 110 / 100);
+        feed.setPrice(address(msft), P_MSFT * 110 / 100);
+        router.setPair(address(usdc), address(aapl), 1e18, P_AAPL * 110 / 100);
+        router.setPair(address(usdc), address(msft), 1e18, P_MSFT * 110 / 100);
+        uint256 supply = vault.totalSupply();
+        _requestRedeem(alice, supply);
+        assertEq(vault.totalSupply(), 0);
+        uint256 fees = vault.accruedFees();
+        assertApproxEqAbs(fees, 20_000e6, 2, "20% of the 10% marked gain");
+        vault.setPerformanceFee(2000);
+        assertEq(vault.accruedFees(), fees, "high-water-mark fee survives full exit");
+        _assertSettledBacking();
+    }
+
+    function test_review_request_admission_is_separate_from_claim_limits() public {
+        assertEq(vault.maxDeposit(bob), 0);
+        assertEq(vault.maxMint(bob), 0);
+        _requestDeposit(bob, 100e6);
+        assertEq(vault.maxDeposit(bob), 0, "pending is not claimable");
+        _fulfill(bob);
+        assertEq(vault.maxDeposit(bob), 100e6);
+        uint256 maxShares = vault.maxMint(bob);
+        assertGt(maxShares, 0);
+        assertLe(vault.convertToAssets(maxShares), 100e6, "maxMint is serviceable at current price");
+        vm.prank(bob);
+        vault.mint(maxShares, bob);
+        assertGe(vault.maxDeposit(bob), 0);
     }
 }

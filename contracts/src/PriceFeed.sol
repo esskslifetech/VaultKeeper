@@ -64,9 +64,11 @@ contract PriceFeed is IStockPriceFeed, Ownable2Step {
     struct PriceData {
         uint256 price;
         uint256 confidence;
-        uint256 updatedAt;
+        uint256 updatedAt; // cache ingestion time, retained for diagnostics
         uint256 sourceCount;
         bool isStale;
+        uint256 observedAt; // oldest accepted source observation
+        uint256 validUntil; // original observation age limit, never reset by a refresh
     }
 
     struct HistoricalPrice {
@@ -81,6 +83,8 @@ contract PriceFeed is IStockPriceFeed, Ownable2Step {
         uint256 minPrice;
         uint256 maxPrice;
         uint256 spread;
+        uint256 observedAt;
+        uint256 validUntil;
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -339,7 +343,7 @@ contract PriceFeed is IStockPriceFeed, Ownable2Step {
             }
         }
 
-        _adoptPrice(asset, result.price, result.confidence, result.sourceCount);
+        _adoptPrice(asset, result.price, result.confidence, result.sourceCount, result.observedAt, result.validUntil);
     }
 
     /// @notice Clears a tripped circuit breaker so the asset can be updated again.
@@ -359,14 +363,27 @@ contract PriceFeed is IStockPriceFeed, Ownable2Step {
         if (price == 0) revert ZeroPrice(asset, "OVERRIDE_ZERO");
 
         circuitBreakerActive[asset] = false;
-        _adoptPrice(asset, price, 0, 0);
+        _adoptPrice(asset, price, 0, 0, block.timestamp, block.timestamp + _threshold(asset));
         emit PriceOverride(asset, price, reason);
     }
 
-    function _adoptPrice(address asset, uint256 price, uint256 confidence, uint256 sourceCount) internal {
+    function _adoptPrice(
+        address asset,
+        uint256 price,
+        uint256 confidence,
+        uint256 sourceCount,
+        uint256 observedAt,
+        uint256 validUntil
+    ) internal {
         _updateHistory(asset, price);
         _priceData[asset] = PriceData({
-            price: price, confidence: confidence, updatedAt: block.timestamp, sourceCount: sourceCount, isStale: false
+            price: price,
+            confidence: confidence,
+            updatedAt: block.timestamp,
+            sourceCount: sourceCount,
+            isStale: false,
+            observedAt: observedAt,
+            validUntil: validUntil
         });
 
         emit PriceUpdated(asset, price, confidence, block.timestamp, sourceCount);
@@ -377,16 +394,15 @@ contract PriceFeed is IStockPriceFeed, Ownable2Step {
     // ────────────────────────────────────────────────────────────────────────
 
     /// @inheritdoc IStockPriceFeed
-    function getPrice(address asset) external view override returns (uint256 price) {
+    function getPrice(address asset) external view override returns (uint256) {
         if (!isAssetRegistered[asset]) revert AssetNotRegistered(asset);
+        if (paused) revert ContractPaused();
         if (circuitBreakerActive[asset]) revert CircuitBreakerActive(asset);
-
         PriceData memory data = _priceData[asset];
         if (data.price == 0) revert ZeroPrice(asset, "NOT_SET");
-
-        uint256 threshold = assetStaleness[asset] > 0 ? assetStaleness[asset] : globalStaleness;
-        if (block.timestamp - data.updatedAt > threshold + HEARTBEAT_GRACE) {
-            revert PriceStale(asset, data.updatedAt, threshold);
+        uint256 validUntil = _effectiveExpiry(asset, data);
+        if (block.timestamp < data.observedAt || block.timestamp > validUntil) {
+            revert PriceStale(asset, data.observedAt, validUntil);
         }
         return data.price;
     }
@@ -397,19 +413,34 @@ contract PriceFeed is IStockPriceFeed, Ownable2Step {
     }
 
     /// @inheritdoc IStockPriceFeed
+    function priceValidity(address asset) external view override returns (uint256, uint256) {
+        PriceData memory data = _priceData[asset];
+        return (data.observedAt, _effectiveExpiry(asset, data));
+    }
+
+    /// @inheritdoc IStockPriceFeed
     function stalenessThreshold() external view override returns (uint256) {
         return globalStaleness;
     }
 
     /// @inheritdoc IStockPriceFeed
     function isPriceFresh(address asset) external view override returns (bool) {
-        if (circuitBreakerActive[asset]) return false;
-
+        if (paused || circuitBreakerActive[asset]) return false;
         PriceData memory data = _priceData[asset];
-        if (data.price == 0) return false;
+        return data.price != 0 && data.observedAt != 0 && block.timestamp >= data.observedAt
+            && block.timestamp <= _effectiveExpiry(asset, data);
+    }
 
-        uint256 threshold = assetStaleness[asset] > 0 ? assetStaleness[asset] : globalStaleness;
-        return (block.timestamp - data.updatedAt) <= threshold;
+    function _threshold(address asset) internal view returns (uint256) {
+        return assetStaleness[asset] > 0 ? assetStaleness[asset] : globalStaleness;
+    }
+
+    /// @dev Shortening the policy tightens existing data immediately. Lengthening it
+    ///      cannot extend the validity approved when the observation was adopted.
+    function _effectiveExpiry(address asset, PriceData memory data) internal view returns (uint256) {
+        if (data.observedAt == 0) return 0;
+        uint256 policyExpiry = data.observedAt + _threshold(asset);
+        return policyExpiry < data.validUntil ? policyExpiry : data.validUntil;
     }
 
     function getPriceData(address asset) external view returns (PriceData memory) {
@@ -446,12 +477,13 @@ contract PriceFeed is IStockPriceFeed, Ownable2Step {
         uint256 confidenceSum;
         uint256 minPrice = type(uint256).max;
         uint256 maxPrice;
+        uint256 oldestObservation = type(uint256).max;
 
         for (uint256 i; i < len; ++i) {
             PriceSource storage src = sources[i];
             if (!src.isActive) continue;
 
-            (bool success, uint256 price, uint256 confidence) = _fetchPrice(src, asset);
+            (bool success, uint256 price, uint256 confidence, uint256 observedAt) = _fetchPrice(src, asset);
             if (success && price > 0) {
                 prices[validCount] = price;
                 weights[validCount] = src.weight;
@@ -459,6 +491,7 @@ contract PriceFeed is IStockPriceFeed, Ownable2Step {
                 confidenceSum += confidence;
                 if (price < minPrice) minPrice = price;
                 if (price > maxPrice) maxPrice = price;
+                if (observedAt < oldestObservation) oldestObservation = observedAt;
                 ++validCount;
 
                 src.lastSuccess = block.timestamp;
@@ -482,7 +515,9 @@ contract PriceFeed is IStockPriceFeed, Ownable2Step {
             sourceCount: validCount,
             minPrice: minPrice,
             maxPrice: maxPrice,
-            spread: maxPrice - minPrice
+            spread: maxPrice - minPrice,
+            observedAt: oldestObservation,
+            validUntil: oldestObservation + _threshold(asset)
         });
     }
 
@@ -523,58 +558,58 @@ contract PriceFeed is IStockPriceFeed, Ownable2Step {
     function _fetchPrice(PriceSource storage src, address asset)
         internal
         view
-        returns (bool success, uint256 price, uint256 confidence)
+        returns (bool, uint256, uint256, uint256)
     {
         if (src.sourceType == SourceType.Chainlink) {
-            return _fetchChainlink(src);
+            return _fetchChainlink(src, asset);
         }
-        if (src.sourceType == SourceType.Pyth) {
-            return _fetchPyth(src, asset);
-        }
-        // Unreachable: {addSource} rejects types that are not implemented.
-        return (false, 0, 0);
+        if (src.sourceType == SourceType.Pyth) return _fetchPyth(src, asset);
+        return (false, 0, 0, 0);
     }
 
-    function _fetchChainlink(PriceSource storage src) internal view returns (bool, uint256, uint256) {
+    /// @dev Provider timestamps must be nonzero, not in the future, and within the
+    ///      asset's age policy. There is no future-timestamp tolerance or cache grace.
+    function _validObservation(uint256 observedAt, address asset) internal view returns (bool) {
+        return observedAt != 0 && observedAt <= block.timestamp && block.timestamp - observedAt <= _threshold(asset);
+    }
+
+    function _fetchChainlink(PriceSource storage src, address asset)
+        internal
+        view
+        returns (bool, uint256, uint256, uint256)
+    {
         try AggregatorV3Interface(src.sourceAddress).latestRoundData() returns (
             uint80, int256 answer, uint256, uint256 updatedAt, uint80
         ) {
-            if (answer <= 0 || updatedAt == 0) return (false, 0, 0);
-
+            if (answer <= 0 || !_validObservation(updatedAt, asset)) return (false, 0, 0, 0);
             uint8 feedDecimals = AggregatorV3Interface(src.sourceAddress).decimals();
-            // `answer > 0` is enforced by the guard above.
             // forge-lint: disable-next-line(unsafe-typecast)
             uint256 normalized = _rescale(uint256(answer), feedDecimals, decimals);
-            return (true, normalized, 0);
+            if (normalized == 0) return (false, 0, 0, 0);
+            return (true, normalized, 0, updatedAt);
         } catch {
-            return (false, 0, 0);
+            return (false, 0, 0, 0);
         }
     }
 
-    function _fetchPyth(PriceSource storage src, address asset) internal view returns (bool, uint256, uint256) {
-        if (src.pythPriceId == bytes32(0)) return (false, 0, 0);
-
+    function _fetchPyth(PriceSource storage src, address asset)
+        internal
+        view
+        returns (bool, uint256, uint256, uint256)
+    {
+        if (src.pythPriceId == bytes32(0)) return (false, 0, 0, 0);
         try IPyth(src.sourceAddress).getPriceUnsafe(src.pythPriceId) returns (PythStructs.Price memory p) {
-            if (p.price <= 0 || p.publishTime == 0) return (false, 0, 0);
-
-            uint256 threshold = assetStaleness[asset] > 0 ? assetStaleness[asset] : globalStaleness;
-            if (block.timestamp > p.publishTime && block.timestamp - p.publishTime > threshold) {
-                return (false, 0, 0);
-            }
-
-            // Pyth reports int64; the positivity guard above makes the widening safe.
+            if (p.price <= 0 || p.publishTime <= 0) return (false, 0, 0, 0);
             // forge-lint: disable-next-line(unsafe-typecast)
-            uint256 rawPrice = uint256(uint64(p.price));
-            uint256 normalized = _rescalePyth(rawPrice, p.expo);
-            if (normalized == 0) return (false, 0, 0);
-
-            uint256 normalizedConfidence;
-            if (p.conf > 0) {
-                normalizedConfidence = _rescalePyth(uint64(p.conf), p.expo);
-            }
-            return (true, normalized, normalizedConfidence);
+            uint256 observedAt = uint256(uint64(p.publishTime));
+            if (!_validObservation(observedAt, asset)) return (false, 0, 0, 0);
+            // forge-lint: disable-next-line(unsafe-typecast)
+            uint256 normalized = _rescalePyth(uint256(uint64(p.price)), p.expo);
+            if (normalized == 0) return (false, 0, 0, 0);
+            uint256 confidence = p.conf > 0 ? _rescalePyth(uint64(p.conf), p.expo) : 0;
+            return (true, normalized, confidence, observedAt);
         } catch {
-            return (false, 0, 0);
+            return (false, 0, 0, 0);
         }
     }
 

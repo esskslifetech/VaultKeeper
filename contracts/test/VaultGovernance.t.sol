@@ -245,7 +245,7 @@ contract VaultGovernanceTest is Test {
         feed.setPrice(address(msft), P_MSFT);
 
         (, bytes memory performData) = automation.checkUpkeep("");
-        (, uint256 bitmask,) = abi.decode(performData, (uint8, uint256, uint256));
+        (, uint256 bitmask,,) = abi.decode(performData, (uint8, uint256, uint256, bytes32));
         assertTrue(bitmask & automation.TRIGGER_FEE_SWEEP() != 0, "sweep due");
 
         uint256 treasuryBefore = usdc.balanceOf(treasury);
@@ -257,7 +257,7 @@ contract VaultGovernanceTest is Test {
         // Immediately afterwards nothing is due, so the bit is clear again.
         (, performData) = automation.checkUpkeep("");
         if (performData.length != 0) {
-            (, bitmask,) = abi.decode(performData, (uint8, uint256, uint256));
+            (, bitmask,,) = abi.decode(performData, (uint8, uint256, uint256, bytes32));
             assertEq(bitmask & automation.TRIGGER_FEE_SWEEP(), 0, "interval restarted");
         }
     }
@@ -271,7 +271,9 @@ contract VaultGovernanceTest is Test {
         assertTrue(needed, "rebalance still due");
 
         // No fees accrued -> sweep bit clear, upkeep still succeeds via the rebalance.
-        automation.performUpkeep(abi.encode(automation.DATA_VERSION(), automation.TRIGGER_TIME_REBALANCE(), uint256(0)));
+        automation.performUpkeep(
+            abi.encode(automation.DATA_VERSION(), automation.TRIGGER_TIME_REBALANCE(), uint256(0), bytes32(0))
+        );
         assertEq(automation.consecutiveFailures(), 0);
     }
 

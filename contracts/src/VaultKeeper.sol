@@ -308,7 +308,9 @@ contract VaultKeeper is ERC4626, ReentrancyGuard, Ownable2Step, IVaultKeeper {
         return uint8(SHARE_DECIMALS_OFFSET);
     }
 
-    /// @notice Net assets under management: gross assets less accrued, uncollected fees.
+    /// @notice Net assets under management: gross assets less booked, uncollected fees.
+    /// @dev Conversions additionally subtract {_pendingFees}, so a quote includes the
+    ///      same elapsed fees that execution will book, without mutating state in a view.
     function totalAssets() public view virtual override(ERC4626) returns (uint256) {
         uint256 gross = grossAssets();
         uint256 fees = accruedFees;
@@ -358,6 +360,21 @@ contract VaultKeeper is ERC4626, ReentrancyGuard, Ownable2Step, IVaultKeeper {
     function maxRedeem(address owner_) public view virtual override(ERC4626) returns (uint256) {
         if (paused) return 0;
         return super.maxRedeem(owner_);
+    }
+
+    /// @dev All ERC-4626 previews and executions use net assets after prospective fees.
+    function _convertToShares(uint256 assets, Math.Rounding rounding) internal view virtual override returns (uint256) {
+        return Math.mulDiv(assets, totalSupply() + 10 ** SHARE_DECIMALS_OFFSET, _netAssets() + 1, rounding);
+    }
+
+    function _convertToAssets(uint256 shares, Math.Rounding rounding) internal view virtual override returns (uint256) {
+        return Math.mulDiv(shares, _netAssets() + 1, totalSupply() + 10 ** SHARE_DECIMALS_OFFSET, rounding);
+    }
+
+    function _netAssets() internal view returns (uint256) {
+        uint256 net = totalAssets();
+        uint256 pending = _pendingFees();
+        return net > pending ? net - pending : 0;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -474,22 +491,17 @@ contract VaultKeeper is ERC4626, ReentrancyGuard, Ownable2Step, IVaultKeeper {
     function _valueInDepositAsset(address asset_, uint256 amount) internal view returns (uint256) {
         if (amount == 0) return 0;
         uint256 price = _priceOf(asset_);
-
-        uint256 usdValue = Math.mulDiv(amount, price, 10 ** priceFeed.decimals());
-        return Math.mulDiv(usdValue, 10 ** depositDecimals, 10 ** _assetDecimals[asset_]);
+        uint256 scale = uint256(priceFeed.decimals()) + _assetDecimals[asset_];
+        if (scale >= depositDecimals) return Math.mulDiv(amount, price, 10 ** (scale - depositDecimals));
+        return Math.mulDiv(amount, price, 1) * 10 ** (depositDecimals - scale);
     }
 
     /// @notice Converts a deposit-asset value into an amount of `asset`, rounding down.
-    /// @dev Exact inverse of {_valueInDepositAsset}.
     function _depositValueToAssetAmount(address asset_, uint256 valueInDepositAsset) internal view returns (uint256) {
         return _depositValueToAssetAmount(asset_, valueInDepositAsset, Math.Rounding.Floor);
     }
 
-    /// @notice Converts a deposit-asset value into an amount of `asset` with explicit rounding.
-    /// @dev `Ceil` is what a caller wants when it must raise *at least* a given amount of
-    ///      cash: a floored input can be worth strictly less than the target after the
-    ///      token's granularity is applied, which makes a correctly enforced
-    ///      `amountOutMinimum` unsatisfiable.
+    /// @notice Full-precision inverse conversion, with the caller's rounding direction.
     function _depositValueToAssetAmount(address asset_, uint256 valueInDepositAsset, Math.Rounding rounding)
         internal
         view
@@ -497,9 +509,14 @@ contract VaultKeeper is ERC4626, ReentrancyGuard, Ownable2Step, IVaultKeeper {
     {
         if (valueInDepositAsset == 0) return 0;
         uint256 price = _priceOf(asset_);
-
-        uint256 usdValue = Math.mulDiv(valueInDepositAsset, 10 ** priceFeed.decimals(), 10 ** depositDecimals);
-        return Math.mulDiv(usdValue, 10 ** _assetDecimals[asset_], price, rounding);
+        uint256 scale = uint256(priceFeed.decimals()) + _assetDecimals[asset_];
+        if (scale >= depositDecimals) {
+            return Math.mulDiv(valueInDepositAsset, 10 ** (scale - depositDecimals), price, rounding);
+        }
+        // ceil(ceil(x / p) / s) == ceil(x / (p*s)), and likewise for floor.
+        // Split only when the combined denominator could overflow uint256.
+        uint256 whole = Math.mulDiv(valueInDepositAsset, 1, price, rounding);
+        return Math.mulDiv(whole, 1, 10 ** (depositDecimals - scale), rounding);
     }
 
     /// @dev Fetches a price and enforces freshness locally, so the vault does not
@@ -509,10 +526,12 @@ contract VaultKeeper is ERC4626, ReentrancyGuard, Ownable2Step, IVaultKeeper {
         uint256 price = feed.getPrice(asset_);
         if (price == 0) revert PriceUnavailable(asset_);
 
-        uint256 updatedAt = feed.lastUpdate(asset_);
-        uint256 threshold = feed.stalenessThreshold();
-        if (updatedAt == 0 || block.timestamp - updatedAt > threshold) {
-            revert StalePrice(asset_, updatedAt, threshold);
+        (uint256 observedAt, uint256 validUntil) = feed.priceValidity(asset_);
+        if (
+            observedAt == 0 || block.timestamp < observedAt || block.timestamp > validUntil
+                || !feed.isPriceFresh(asset_)
+        ) {
+            revert StalePrice(asset_, observedAt, validUntil);
         }
         return price;
     }
@@ -607,12 +626,13 @@ contract VaultKeeper is ERC4626, ReentrancyGuard, Ownable2Step, IVaultKeeper {
         emit Rebalanced(block.timestamp, totalAssets(), moved);
     }
 
-    /// @dev Sells strategy positions until at least `required` deposit asset is idle.
+    /// @dev Raises unreserved cash. Reserved buckets are never consumed by another exit.
     function _ensureLiquidity(uint256 required) internal {
+        uint256 target = required + _reservedCash();
         uint256 cash = depositAsset.balanceOf(address(this));
-        if (cash >= required) return;
+        if (cash >= target) return;
 
-        uint256 shortfall = required - cash;
+        uint256 shortfall = target - cash;
         uint256 len = _assets.length;
 
         for (uint256 i; i < len && shortfall != 0; ++i) {
@@ -639,7 +659,38 @@ contract VaultKeeper is ERC4626, ReentrancyGuard, Ownable2Step, IVaultKeeper {
         }
 
         uint256 available = depositAsset.balanceOf(address(this));
-        if (available < required) revert InsufficientLiquidity(required, available);
+        if (available < target) revert InsufficientLiquidity(target, available);
+    }
+
+    /// @dev Settles an exit at its oracle-marked value, but pays only realizable proceeds.
+    ///      The exiting request bears venue costs; remaining holders' marked NAV is
+    ///      reduced by the marked entitlement, not by the larger amount a venue needs.
+    ///      Called before creating a fixed async liability. Reentrancy is blocked by the
+    ///      caller, and all existing reserved buckets remain untouched.
+    function _settleExitCash(uint256 markedValue) internal returns (uint256 proceeds) {
+        if (markedValue == 0) revert ZeroAmount();
+        uint256 cash = depositAsset.balanceOf(address(this));
+        uint256 reserved = _reservedCash();
+        uint256 available = cash > reserved ? cash - reserved : 0;
+        proceeds = markedValue < available ? markedValue : available;
+        uint256 remaining = markedValue - proceeds;
+
+        for (uint256 i; i < _assets.length && remaining != 0; ++i) {
+            address asset_ = _assets[i];
+            uint256 balance = IERC20(asset_).balanceOf(address(this));
+            if (balance == 0) continue;
+            uint256 positionValue = _valueInDepositAsset(asset_, balance);
+            uint256 sellValue = remaining < positionValue ? remaining : positionValue;
+            uint256 sellAmount = _depositValueToAssetAmount(asset_, sellValue, Math.Rounding.Ceil);
+            if (sellAmount > balance) sellAmount = balance;
+            if (sellAmount == 0) continue;
+            uint256 minOut = sellValue - Math.mulDiv(sellValue, maxSlippageBps, BPS_DENOMINATOR);
+            uint256 received = _swap(asset_, address(depositAsset), sellAmount, minOut);
+            if (received > sellValue) received = sellValue;
+            proceeds += received;
+            remaining -= sellValue;
+        }
+        if (remaining != 0 || proceeds == 0) revert InsufficientLiquidity(markedValue, proceeds);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -695,42 +746,42 @@ contract VaultKeeper is ERC4626, ReentrancyGuard, Ownable2Step, IVaultKeeper {
     ///      {totalAssets} subtracts that figure, the share price drops immediately and
     ///      collection later is not dilutive.
     function _assessFees() internal {
-        uint256 elapsed = block.timestamp - _lastFeeAssessment;
-        if (elapsed == 0) return;
-        // Internal fee-accrual cursor: it is a clock, not a balance, and every value
-        // derived from it is reported by FeesAssessed / HighWaterMarkUpdated below.
-        // forge-lint: disable-next-line(missing-events-arithmetic)
+        (uint256 feeAssets, uint256 nextMark) = _feeAssessment();
         _lastFeeAssessment = block.timestamp;
-
-        if (managementFee == 0 && performanceFee == 0) return;
-
-        uint256 total = totalAssets();
-        uint256 supply = totalSupply();
-        if (total == 0 || supply == 0) return;
-
-        uint256 feeAssets;
-
-        if (managementFee != 0) {
-            feeAssets += Math.mulDiv(total, managementFee * elapsed, 365 days * BPS_DENOMINATOR);
+        if (nextMark > _highWaterMark) {
+            emit HighWaterMarkUpdated(_highWaterMark, nextMark);
+            _highWaterMark = nextMark;
         }
-
-        if (performanceFee != 0) {
-            uint256 pps = Math.mulDiv(1e18, total + 1, supply + 10 ** SHARE_DECIMALS_OFFSET);
-            if (_highWaterMark == 0) {
-                _highWaterMark = pps;
-            } else if (pps > _highWaterMark) {
-                uint256 profitPerShare = pps - _highWaterMark;
-                uint256 profit = Math.mulDiv(profitPerShare, supply, 1e18);
-                feeAssets += Math.mulDiv(profit, performanceFee, BPS_DENOMINATOR);
-                uint256 previousMark = _highWaterMark;
-                _highWaterMark = pps;
-                emit HighWaterMarkUpdated(previousMark, pps);
-            }
-        }
-
         if (feeAssets != 0) {
             accruedFees += feeAssets;
-            emit FeesAssessed(block.timestamp, managementFee, performanceFee, total);
+            emit FeesAssessed(block.timestamp, managementFee, performanceFee, totalAssets());
+        }
+    }
+
+    function _pendingFees() internal view returns (uint256 feeAssets) {
+        (feeAssets,) = _feeAssessment();
+    }
+
+    /// @dev One calculation for both quotes and settlement. Neither branch mutates state.
+    function _feeAssessment() internal view returns (uint256 feeAssets, uint256 nextMark) {
+        nextMark = _highWaterMark;
+        uint256 elapsed = block.timestamp - _lastFeeAssessment;
+        if (managementFee == 0 && performanceFee == 0) return (0, nextMark);
+        uint256 total = totalAssets();
+        uint256 supply = totalSupply();
+        if (total == 0 || supply == 0) return (0, nextMark);
+        if (managementFee != 0) {
+            feeAssets = Math.mulDiv(total, managementFee * elapsed, 365 days * BPS_DENOMINATOR);
+        }
+        if (performanceFee != 0) {
+            uint256 pps = Math.mulDiv(1e18, total + 1, supply + 10 ** SHARE_DECIMALS_OFFSET);
+            if (nextMark == 0) {
+                nextMark = pps;
+            } else if (pps > nextMark) {
+                uint256 profit = Math.mulDiv(pps - nextMark, supply, 1e18);
+                feeAssets += Math.mulDiv(profit, performanceFee, BPS_DENOMINATOR);
+                nextMark = pps;
+            }
         }
     }
 
@@ -859,6 +910,13 @@ contract VaultKeeper is ERC4626, ReentrancyGuard, Ownable2Step, IVaultKeeper {
         address[] memory oldAssets = _assets;
         uint256[] memory oldWeights = new uint256[](oldAssets.length);
         for (uint256 i; i < oldAssets.length; ++i) {
+            bool retained;
+            for (uint256 j; j < newStrategy.assets.length; ++j) {
+                if (newStrategy.assets[j] == oldAssets[i]) retained = true;
+            }
+            if (!retained && IERC20(oldAssets[i]).balanceOf(address(this)) != 0) {
+                revert StrategyAssetNotEmpty(oldAssets[i]);
+            }
             oldWeights[i] = _targetWeights[oldAssets[i]];
             delete _targetWeights[oldAssets[i]];
         }
@@ -882,7 +940,7 @@ contract VaultKeeper is ERC4626, ReentrancyGuard, Ownable2Step, IVaultKeeper {
         emit StrategyUpdated(oldAssets, oldWeights, newStrategy.assets, newStrategy.weights);
     }
 
-    function _validateStrategy(address[] memory assets_, uint256[] memory weights) internal pure {
+    function _validateStrategy(address[] memory assets_, uint256[] memory weights) internal view {
         uint256 len = assets_.length;
         if (len != weights.length) revert InvalidStrategy("LENGTH_MISMATCH");
         if (len == 0 || len > MAX_STRATEGIES) revert InvalidStrategy("INVALID_LENGTH");
@@ -890,6 +948,7 @@ contract VaultKeeper is ERC4626, ReentrancyGuard, Ownable2Step, IVaultKeeper {
         uint256 sum;
         for (uint256 i; i < len; ++i) {
             if (assets_[i] == address(0)) revert InvalidStrategy("ZERO_ADDRESS");
+            if (assets_[i] == address(depositAsset)) revert InvalidStrategy("DEPOSIT_ASSET");
             if (weights[i] > MAX_SINGLE_WEIGHT) revert InvalidStrategy("MAX_WEIGHT");
             for (uint256 j = i + 1; j < len; ++j) {
                 if (assets_[i] == assets_[j]) revert InvalidStrategy("DUPLICATE_ASSET");
@@ -957,12 +1016,12 @@ contract VaultKeeper is ERC4626, ReentrancyGuard, Ownable2Step, IVaultKeeper {
     }
 
     /// @inheritdoc IVaultKeeper
-    function setFeeTierOverride(address asset, uint24 fee) external onlyOwner {
+    function setFeeTierOverride(address strategyAsset, uint24 fee) external onlyOwner {
         if (fee > MAX_FEE_TIER) revert InvalidParameter("feeTier", fee);
-        if (fee != 0 && _targetWeights[asset] == 0) revert UnknownStrategyAsset(asset);
-        uint24 old = feeTierOverride[asset];
-        feeTierOverride[asset] = fee;
-        emit FeeTierOverrideUpdated(asset, old, fee);
+        if (fee != 0 && _targetWeights[strategyAsset] == 0) revert UnknownStrategyAsset(strategyAsset);
+        uint24 old = feeTierOverride[strategyAsset];
+        feeTierOverride[strategyAsset] = fee;
+        emit FeeTierOverrideUpdated(strategyAsset, old, fee);
     }
 
     /// @inheritdoc IVaultKeeper
@@ -1018,6 +1077,9 @@ contract VaultKeeper is ERC4626, ReentrancyGuard, Ownable2Step, IVaultKeeper {
         if (receiver == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
         IERC20(token).safeTransfer(receiver, amount);
+        uint256 cash = depositAsset.balanceOf(address(this));
+        uint256 reserved = _reservedCash();
+        if (cash < reserved || grossAssets() < reserved) revert ReservedCash(cash, reserved);
         emit EmergencyWithdraw(token, amount, receiver);
     }
 }

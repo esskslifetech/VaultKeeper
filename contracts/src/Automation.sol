@@ -43,6 +43,10 @@ error CircuitBreakerTripped(uint256 failures, uint256 max);
 error KeeperNotAllowed(address keeper);
 error VaultKeeperNotAuthorized(address automation, address vaultKeeper);
 error LiquidationNotConfigured();
+error LiquidationDisabled();
+error InvalidLiquidationPrice(string symbol);
+error NoMatchingWork(uint256 requested, uint256 due);
+error StaleLiquidationSelection();
 error ZeroAddress();
 
 /// @title Automation
@@ -69,7 +73,7 @@ contract Automation is AutomationCompatibleInterface, ReentrancyGuard {
     uint256 public constant DEFAULT_MAX_CONSECUTIVE_FAILURES = 3;
     /// @notice Oldest xStocks quote that may be used to size a liquidation.
     uint256 public constant XSTOCK_PRICE_MAX_AGE = 1 hours;
-    uint8 public constant DATA_VERSION = 1;
+    uint8 public constant DATA_VERSION = 2;
 
     /// @notice Selector of the built-in `Error(string)` revert type.
     bytes4 public constant ERROR_STRING_SELECTOR = 0x08c379a0;
@@ -140,6 +144,7 @@ contract Automation is AutomationCompatibleInterface, ReentrancyGuard {
     event KeeperWhitelistUpdated(address keeper, bool allowed);
     event MaxConsecutiveFailuresUpdated(uint256 oldValue, uint256 newValue);
     event UpkeepExecuted(uint256 timestamp, uint256 triggerBitmask, bool success, uint256 gasUsed);
+    event UpkeepRejected(uint256 requested, uint256 due);
     event CircuitBreakerReset(uint256 previousFailures, address by);
     event CollateralConfigured(address asset, address priceFeed);
     event FeeSweepExecuted(uint256 timestamp, uint256 amount);
@@ -229,26 +234,9 @@ contract Automation is AutomationCompatibleInterface, ReentrancyGuard {
         // Never request work we are not authorised to perform.
         if (!vaultKeeperAuthorized()) return (false, "");
 
-        uint256 triggerBitmask;
-        uint256 context;
-
-        if (_checkTimeRebalance()) triggerBitmask |= TRIGGER_TIME_REBALANCE;
-        if (_checkPriceDeviation()) triggerBitmask |= TRIGGER_PRICE_DEVIATION;
-        if (_checkFeeSweep()) triggerBitmask |= TRIGGER_FEE_SWEEP;
-
-        if (liquidationEnabled && address(xStocks) != address(0) && collateralAsset != address(0)) {
-            uint256 liqContext = _checkLiquidationOpportunity();
-            if (liqContext != 0) {
-                triggerBitmask |= TRIGGER_LIQUIDATION;
-                context = liqContext;
-            }
-        }
-
-        if (triggerBitmask != 0) {
-            performData = abi.encode(DATA_VERSION, triggerBitmask, context);
-            return (true, performData);
-        }
-        return (false, "");
+        (uint256 triggers, uint256 context) = _selectWork();
+        if (triggers == 0) return (false, "");
+        return (true, abi.encode(DATA_VERSION, triggers, context, _stockListHash()));
     }
 
     /// @inheritdoc AutomationCompatibleInterface
@@ -259,8 +247,22 @@ contract Automation is AutomationCompatibleInterface, ReentrancyGuard {
             revert ConsecutiveFailuresExceeded(consecutiveFailures, maxConsecutiveFailures);
         }
 
-        (uint8 version, uint256 triggerBitmask, uint256 context) = _decodePerformData(performData);
+        (uint8 version, uint256 triggerBitmask, uint256 context, bytes32 stockHash) = _decodePerformData(performData);
         if (version != DATA_VERSION) revert UnsupportedDataVersion(version);
+        uint256 known = TRIGGER_TIME_REBALANCE | TRIGGER_PRICE_DEVIATION | TRIGGER_LIQUIDATION | TRIGGER_FEE_SWEEP;
+        (uint256 due, uint256 dueContext) = _selectWork();
+        if (triggerBitmask == 0 || triggerBitmask & ~known != 0 || triggerBitmask & ~due != 0) {
+            emit UpkeepRejected(triggerBitmask, due);
+            revert NoMatchingWork(triggerBitmask, due);
+        }
+        if (triggerBitmask & TRIGGER_LIQUIDATION != 0) {
+            if (stockHash != _stockListHash() || context == 0 || context & ~dueContext != 0) {
+                revert StaleLiquidationSelection();
+            }
+        } else if (context != 0 || stockHash != bytes32(0)) {
+            revert NoMatchingWork(triggerBitmask, due);
+        }
+        if (!vaultKeeperAuthorized()) revert VaultKeeperNotAuthorized(address(this), vault.keeper());
 
         bool anySuccess;
 
@@ -295,6 +297,30 @@ contract Automation is AutomationCompatibleInterface, ReentrancyGuard {
     // ────────────────────────────────────────────────────────────────────────
     //  Trigger checks
     // ────────────────────────────────────────────────────────────────────────
+
+    function _selectWork() internal view returns (uint256 triggers, uint256 context) {
+        if (_checkTimeRebalance()) triggers |= TRIGGER_TIME_REBALANCE;
+        if (_checkPriceDeviation()) triggers |= TRIGGER_PRICE_DEVIATION;
+        if (_checkFeeSweep()) triggers |= TRIGGER_FEE_SWEEP;
+        if (
+            liquidationEnabled && address(xStocks) != address(0) && collateralAsset != address(0)
+                && address(collateralPriceFeed) != address(0)
+        ) {
+            context = _checkLiquidationOpportunity();
+            if (context != 0) triggers |= TRIGGER_LIQUIDATION;
+        }
+    }
+
+    function _stockListHash() internal view returns (bytes32) {
+        if (!liquidationEnabled || address(xStocks) == address(0)) return bytes32(0);
+        string[] memory stocks = xStocks.getSupportedStocks();
+        uint256 len = stocks.length > MAX_CHECK_ASSETS ? MAX_CHECK_ASSETS : stocks.length;
+        bytes32[] memory identities = new bytes32[](len);
+        for (uint256 i; i < len; ++i) {
+            identities[i] = keccak256(bytes(stocks[i]));
+        }
+        return keccak256(abi.encode(identities));
+    }
 
     /// @dev True when the vault has fees sitting idle and its sweep interval has elapsed.
     ///      Wrapped in try/catch so Automation also works against a vault revision that
@@ -342,7 +368,7 @@ contract Automation is AutomationCompatibleInterface, ReentrancyGuard {
         for (uint256 i; i < len; ++i) {
             if (xStocks.xStockBalanceOf(address(vault), stocks[i]) == 0) continue;
             if (xStocks.isPositionLiquidatable(address(vault), stocks[i])) {
-                context |= (1 << i);
+                context |= uint256(1) << i;
             }
         }
     }
@@ -366,7 +392,6 @@ contract Automation is AutomationCompatibleInterface, ReentrancyGuard {
     /// @dev Permissionless on the vault side, so the keeper simply triggers it. The
     ///      interval check lives in the vault, which keeps this safe to run every upkeep.
     function _executeFeeSweep() internal returns (bool) {
-        // forge-lint: disable-next-line(reentrancy-no-eth)
         try vault.sweepFees() returns (uint256 amount) {
             emit FeeSweepExecuted(block.timestamp, amount);
             return true;
@@ -378,27 +403,28 @@ contract Automation is AutomationCompatibleInterface, ReentrancyGuard {
 
     /// @param context Bitmask of holdings to liquidate, indexed by `getSupportedStocks()`.
     function _executeLiquidations(uint256 context) internal returns (bool anySuccess) {
-        if (address(xStocks) == address(0)) return false;
-        if (collateralAsset == address(0) || address(collateralPriceFeed) == address(0)) {
-            revert LiquidationNotConfigured();
-        }
+        if (!liquidationEnabled) revert LiquidationDisabled();
+        if (
+            address(xStocks) == address(0) || collateralAsset == address(0)
+                || address(collateralPriceFeed) == address(0)
+        ) revert LiquidationNotConfigured();
 
         string[] memory stocks = xStocks.getSupportedStocks();
-        uint256 len = stocks.length;
-        if (len > MAX_LIQUIDATION_BATCH) len = MAX_LIQUIDATION_BATCH;
+        uint256 len = stocks.length > MAX_CHECK_ASSETS ? MAX_CHECK_ASSETS : stocks.length;
+        uint256 processed;
 
-        for (uint256 i; i < len; ++i) {
+        for (uint256 i; i < len && processed < MAX_LIQUIDATION_BATCH; ++i) {
             if ((context >> i) & 1 == 0) continue;
 
             string memory symbol = stocks[i];
             uint256 balance = xStocks.xStockBalanceOf(address(vault), symbol);
-            if (balance == 0) continue;
-
+            if (balance == 0 || !xStocks.isPositionLiquidatable(address(vault), symbol)) continue;
             uint256 minCollateralOut = _minCollateralOut(balance, symbol);
+            if (minCollateralOut == 0) revert InvalidLiquidationPrice(symbol);
+            ++processed;
 
             // performUpkeep is nonReentrant and governor/keeper gated; state below is
             // only accounting for the community keeper's report.
-            // forge-lint: disable-next-line(reentrancy-no-eth)
             try xStocks.liquidate(address(vault), symbol, balance, minCollateralOut) returns (
                 uint256 collateralSeized, uint256
             ) {
@@ -415,18 +441,24 @@ contract Automation is AutomationCompatibleInterface, ReentrancyGuard {
     ///      `balance` (18dp xStock) -> USD (8dp) -> less slippage -> collateral units.
     function _minCollateralOut(uint256 balance, string memory symbol) internal view returns (uint256) {
         (uint256 price, uint256 updatedAt) = xStocks.getStockPrice(symbol);
-        if (price == 0) return 0;
-        // A stale quote must not set the floor for a real liquidation: better to skip
-        // (returning 0 makes the caller skip the position) than to accept too little.
-        if (updatedAt != 0 && block.timestamp - updatedAt > XSTOCK_PRICE_MAX_AGE) return 0;
+        if (
+            price == 0 || updatedAt == 0 || updatedAt > block.timestamp
+                || block.timestamp - updatedAt > XSTOCK_PRICE_MAX_AGE
+        ) revert InvalidLiquidationPrice(symbol);
 
         uint256 valueUsd = Math.mulDiv(balance, price, 10 ** 18);
         uint256 minUsd = valueUsd - Math.mulDiv(valueUsd, liquidationSlippageBps, BPS_DENOMINATOR);
 
         uint256 collateralPrice = collateralPriceFeed.getPrice(collateralAsset);
-        if (collateralPrice == 0) return 0;
-
+        (uint256 observedAt, uint256 validUntil) = collateralPriceFeed.priceValidity(collateralAsset);
+        if (
+            collateralPrice == 0 || observedAt == 0 || block.timestamp < observedAt || block.timestamp > validUntil
+                || !collateralPriceFeed.isPriceFresh(collateralAsset)
+        ) {
+            revert InvalidLiquidationPrice(symbol);
+        }
         uint8 collateralDecimals = IERC20Metadata(collateralAsset).decimals();
+        if (collateralDecimals > 36 || collateralPriceFeed.decimals() > 36) revert InvalidLiquidationPrice(symbol);
 
         // minUsd is 8-decimal USD. Scale it to the collateral feed's precision, then
         // divide by the price to land in collateral-token units.
@@ -442,10 +474,10 @@ contract Automation is AutomationCompatibleInterface, ReentrancyGuard {
     function _decodePerformData(bytes calldata data)
         internal
         pure
-        returns (uint8 version, uint256 triggerBitmask, uint256 context)
+        returns (uint8 version, uint256 triggerBitmask, uint256 context, bytes32 stockHash)
     {
-        if (data.length == 0) return (0, 0, 0);
-        (version, triggerBitmask, context) = abi.decode(data, (uint8, uint256, uint256));
+        if (data.length == 0) return (0, 0, 0, bytes32(0));
+        (version, triggerBitmask, context, stockHash) = abi.decode(data, (uint8, uint256, uint256, bytes32));
     }
 
     /// @dev Wraps an internal note in the `Error(string)` ABI so the error recorder
